@@ -37,7 +37,9 @@ def test_value_is_weighted_mean_of_atoms():
 def test_score_table_buffer():
     net = PlumpNet()
     assert net.score_table[3, 3].item() == 13
-    assert net.score_table[3, 2].item() == -1
+    assert net.score_table[3, 2].item() == 0  # miss: no negatives by default
+    assert net.score_table[0, 0].item() == 5  # made 0-bid: the "05" rule
+    assert net.score_table[10, 10].item() == 20
 
 
 def test_log_prob_masking():

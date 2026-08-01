@@ -3,9 +3,9 @@
 A strong Plump-playing agent trained on a single consumer GPU: **Rust game engine + PyTorch**.
 
 Plump is a trick-taking card game. Each player bids how many tricks they will win; you score
-`10 + bid` for making the bid exactly and `-|tricks - bid|` otherwise. A ladder of rounds decides
-the match. The full master plan (motivations, architecture, and failure modes) lives in
-[`original plan/plan.md`](original%20plan/plan.md).
+`10 + bid` for making the bid exactly (a made 0-bid scores 5, the "05" rule) and a miss scores 0.
+A ladder of rounds decides the match. The full master plan (motivations, architecture, and
+failure modes) lives in [`original plan/plan.md`](original%20plan/plan.md).
 
 ## Design at a glance
 

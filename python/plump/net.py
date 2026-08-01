@@ -27,10 +27,10 @@ class PlumpNet(nn.Module):
         self.score_atoms = _score_atoms(sc, nc.min_atoms)
         self.register_buffer("atoms", torch.tensor(self.score_atoms, dtype=torch.float32))
         # score_table[bid][tricks] for the factored post-bid value (§4.2).
-        tbl = torch.full((sc.max_bid + 1, sc.max_bid + 1), sc.miss_penalty, dtype=torch.float32)
+        tbl = torch.full((sc.max_bid + 1, sc.max_bid + 1), 0, dtype=torch.float32)
         for bid in range(sc.min_bid, sc.max_bid + 1):
             for tricks in range(sc.max_bid + 1):
-                tbl[bid, tricks] = sc.make_bonus + bid if bid == tricks else -sc.miss_penalty * abs(bid - tricks)
+                tbl[bid, tricks] = _score(sc, bid, tricks)
         self.register_buffer("score_table", tbl)
 
         # index n_features is a no-op pad (padding_idx zeroes it and drops its
@@ -86,9 +86,17 @@ class PlumpNet(nn.Module):
         return -(p * torch.log_softmax(logits, -1)).sum(-1)
 
 
+def _score(sc: config.ScoringConfig, bid: int, tricks: int) -> int:
+    if bid == tricks:
+        if bid == 0:
+            return sc.zero_bid_bonus  # special case: the "05" rule
+        return sc.make_bonus + bid
+    return -sc.miss_penalty * abs(bid - tricks)
+
+
 def _score_atoms(sc: config.ScoringConfig, min_atoms: int) -> list[int]:
     atoms = sorted({
-        sc.make_bonus + bid if bid == tricks else -sc.miss_penalty * abs(bid - tricks)
+        _score(sc, bid, tricks)
         for bid in range(sc.min_bid, sc.max_bid + 1)
         for tricks in range(0, sc.max_bid + 1)
     })

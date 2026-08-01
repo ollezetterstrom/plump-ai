@@ -3,6 +3,8 @@
 
 import pytest
 
+from plump import config
+
 plump_engine = pytest.importorskip("plump._engine")
 
 
@@ -35,9 +37,19 @@ def test_permutation_table_shape_and_bijectivity():
 
 def test_score_and_atoms():
     assert plump_engine.score(3, 3) == 13
-    assert plump_engine.score(3, 2) == -1
+    assert plump_engine.score(10, 10) == 20
+    assert plump_engine.score(0, 0) == 5  # special case: the "05" rule
+    assert plump_engine.score(3, 2) == 0  # miss: no negatives by default
     atoms = plump_engine.score_atoms()
-    assert atoms[0] == -10 and atoms[-1] == 20
+    assert atoms == [0, 5, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+
+
+def test_atoms_match_python_net():
+    # Parity: Rust atoms must equal the Python net's atom support, so the
+    # value head can never drift from the engine's scoring (§5.2).
+    from plump.net import _score_atoms  # noqa: PLC0415
+    assert plump_engine.score_atoms() == _score_atoms(
+        config.ScoringConfig(), min_atoms=0)
 
 
 def test_legal_masks():

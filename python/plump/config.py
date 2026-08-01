@@ -15,7 +15,8 @@ N_BELIEF_CLASSES = 8
 @dataclass
 class ScoringConfig:
     make_bonus: int = 10
-    miss_penalty: int = 1
+    miss_penalty: int = 0  # 0 = a miss scores 0 points (common rule)
+    zero_bid_bonus: int = 5  # special case: a made 0-bid (the "05" rule)
     min_bid: int = 0
     max_bid: int = 10
 
