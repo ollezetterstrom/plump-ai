@@ -21,10 +21,10 @@ failure modes) lives in [`original plan/plan.md`](original%20plan/plan.md).
 ## Layout
 
 ```
-crates/plump-engine/   Rust game engine (cards, scoring, legal, layout, knowledge, encoder)
+crates/plump-engine/   Rust game engine (cards, scoring, legal, layout, knowledge, encoder, rollout)
 crates/plump-py/       PyO3 bridge -> plump._engine
-python/plump/          Python package (config, net, train)
-python/tests/          Python tests (engine bridge + network)
+python/plump/          Python package (config, net, rollout, train, heuristic)
+python/tests/          Python tests (engine bridge + network + trainer)
 original plan/         The master plan
 ```
 
@@ -40,6 +40,23 @@ make test       # run Rust + Python tests
 
 `cargo test` runs the Rust suite without any Python; `make test-py` runs the Python suite.
 
+## Training
+
+The Phase 4 trainer rolls out `batch` games in lockstep through the Rust engine,
+then applies a per-seat PPO update over the fixed-shape trajectory buffers:
+
+```
+.venv/bin/python -m plump.train --iters 100 --batch 4096 --players 4 --cards 5 --eval-games 1024
+```
+
+Every iteration plays a full round and prints rollout/update timing and the
+approx-KL; after training it reports duplicate-deal evals against random and the
+`heuristic.py` baseline. Set `--device mps` (or `cuda`) to train on the GPU; the
+default is the best available backend.
+
 ## Status
 
-Phase 0 (scaffolding) is complete; the round engine is next. See [ROADMAP.md](ROADMAP.md).
+Phase 0–3 (engine, encoder, rollout driver) are complete. Phase 4 — the network and
+per-seat PPO trainer — is implemented and training; the exit criterion is to beat
+random by > 8 pts/round and a hand-coded heuristic on `P=4, C=5`. See
+[ROADMAP.md](ROADMAP.md).
