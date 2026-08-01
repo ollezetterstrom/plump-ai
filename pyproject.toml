@@ -1,0 +1,20 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "plump"
+version = "0.1.0"
+description = "A strong Plump AI on a consumer GPU (Rust engine + PyTorch)"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.1"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[tool.maturin]
+python-source = "python"
+module-name = "plump._engine"
+
+[tool.pytest.ini_options]
+testpaths = ["python/tests"]

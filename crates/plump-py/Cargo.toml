@@ -1,0 +1,17 @@
+[package]
+name = "plump-py"
+description = "PyO3 bridge exposing the Rust engine to Python"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "_engine"
+crate-type = ["cdylib"]
+
+[features]
+extension-module = ["pyo3/extension-module"]
+
+[dependencies]
+plump-engine = { workspace = true }
+pyo3 = { workspace = true }

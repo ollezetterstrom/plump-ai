@@ -1,0 +1,10 @@
+[package]
+name = "plump-engine"
+description = "Rust game engine for Plump (encoding, legality, public knowledge, layout)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
