@@ -16,6 +16,10 @@ pub const N_SUITS: usize = 4;
 pub const N_RANKS: usize = 13;
 pub const N_CARDS: usize = 52;
 
+/// Maximum supported number of players (layout/state slots are fixed-width at
+/// this size; seats `P..MAX_SEATS` are simply never emitted).
+pub const MAX_SEATS: usize = 6;
+
 /// Suit of a card, `0..4`.
 #[inline]
 pub const fn suit(c: Card) -> u8 {

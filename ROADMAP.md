@@ -5,7 +5,8 @@ Milestones track the phases in the [master plan](original%20plan/plan.md) (§11)
 | Phase | Milestone | Days | Exit criterion | Status |
 |---|---|---|---|---|
 | 0 | Scaffolding, card types, scoring config | 0 | `cargo test` green | done |
-| 1 | Single-game engine, `PublicKnowledge`, legal masks | 1–2 | Property tests green; brute-force `P=3,C=2` tree enumerable | next |
+| 1 | Single-game engine, `PublicKnowledge`, legal masks | 1–2 | Property tests green; brute-force `P=3,C=2` tree enumerable | done |
+| 2 | Layout registry, encoder, permutation table, SoA batch | 3–4 | Parity + invariance tests green; encode >= 2M states/s on 16 cores | next |
 | 2 | Layout registry, encoder, permutation table, SoA batch | 3–4 | Parity + invariance tests green; encode >= 2M states/s on 16 cores | planned |
 | 3 | PyO3 bridge, pinned buffers, double buffering | 5 | Full rollout of 16k games at >= 40 steps/s | planned |
 | 4 | Network, per-seat PPO, distributional value, aux heads | 6–8 | Beats random by > 8 pts/round; beats heuristic on `P=4,C=5` | planned |
@@ -17,6 +18,7 @@ Milestones track the phases in the [master plan](original%20plan/plan.md) (§11)
 
 ## Current focus
 
-**Phase 1 — single-game round engine.** Implement the deal, bidding, and play loop in Rust with
-`PublicKnowledge` maintained incrementally, then make the `P=3, C=2` game tree brute-force
-enumerable as the correctness reference.
+**Phase 2 — batch encoder.** Implement the actor-relative feature encoder over the layout
+registry: bit-iteration over card sets, fixed-width `[B, K_MAX]` output, the parity property test
+(`encode(permute(s, σ)) == permute_indices(encode(s), σ)`) and the seat-relabeling invariance
+test, then measure the `>= 2M states/s` throughput target on 16 cores.
