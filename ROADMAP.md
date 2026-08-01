@@ -7,7 +7,6 @@ Milestones track the phases in the [master plan](original%20plan/plan.md) (§11)
 | 0 | Scaffolding, card types, scoring config | 0 | `cargo test` green | done |
 | 1 | Single-game engine, `PublicKnowledge`, legal masks | 1–2 | Property tests green; brute-force `P=3,C=2` tree enumerable | done |
 | 2 | Layout registry, encoder, permutation table, SoA batch | 3–4 | Parity + invariance tests green; encode >= 2M states/s on 16 cores | next |
-| 2 | Layout registry, encoder, permutation table, SoA batch | 3–4 | Parity + invariance tests green; encode >= 2M states/s on 16 cores | planned |
 | 3 | PyO3 bridge, pinned buffers, double buffering | 5 | Full rollout of 16k games at >= 40 steps/s | planned |
 | 4 | Network, per-seat PPO, distributional value, aux heads | 6–8 | Beats random by > 8 pts/round; beats heuristic on `P=4,C=5` | planned |
 | 5 | All configs, per-deal suit relabeling, opponent pool (K=2), duplicate-deal baselining | 9–11 | Trick-head calibration ECE < 0.03; best-response gap measured | planned |

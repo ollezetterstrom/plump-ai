@@ -79,7 +79,7 @@ pub const LAYOUT: &[Block] = &[
         offset: 765,
         size: 78,
         suit_rule: SuitRule::Agnostic,
-    }, // 6*(11+1 unknown)
+    }, // 6*13 = bid 0..=10, "unknown", 1 reserved
     Block {
         name: "tricks_rel",
         offset: 843,

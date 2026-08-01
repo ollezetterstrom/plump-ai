@@ -69,6 +69,25 @@ pub fn popcount(s: CardSet) -> u32 {
     s.count_ones()
 }
 
+/// Maps a card through a suit permutation (rank preserved).
+#[inline]
+pub fn relabel_card(c: Card, perm: &[u8; 4]) -> Card {
+    card(perm[suit(c) as usize], rank(c))
+}
+
+/// Maps every card in a set through a suit permutation (§5.4).
+#[inline]
+pub fn relabel_set(s: CardSet, perm: &[u8; 4]) -> CardSet {
+    let mut out: CardSet = 0;
+    let mut m = s;
+    while m != 0 {
+        let c = m.trailing_zeros() as u8;
+        m &= m - 1;
+        out |= bit(relabel_card(c, perm));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,5 +127,26 @@ mod tests {
         assert_eq!(bit(51), 1u64 << 51);
         let s = bit(3) | bit(9) | bit(3);
         assert_eq!(popcount(s), 2);
+    }
+
+    #[test]
+    fn relabel_permutes_suit_keeps_rank() {
+        let perm = [1u8, 0, 3, 2];
+        let c = card(2, 5);
+        let rc = relabel_card(c, &perm);
+        assert_eq!(suit(rc), 3);
+        assert_eq!(rank(rc), 5);
+        let s = bit(c) | bit(0); // suit2 r5 + suit0 r0
+        let rs = relabel_set(s, &perm);
+        assert_eq!(rs, bit(card(3, 5)) | bit(card(1, 0)));
+        assert_eq!(rs.count_ones(), 2);
+    }
+
+    #[test]
+    fn relabel_set_followed_by_same_perm_is_identity() {
+        let perm = [2u8, 3, 0, 1];
+        let s = bit(0) | bit(13) | bit(51);
+        let back = relabel_set(relabel_set(s, &perm), &perm);
+        assert_eq!(back, s);
     }
 }

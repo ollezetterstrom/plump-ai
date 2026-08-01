@@ -7,7 +7,7 @@
 //! identity. In debug builds the round invariant is asserted at the end:
 //! every game consumes exactly `P + P*C` decisions.
 
-use crate::cards::{bit, suit, Card, CardSet, FULL_DECK, MAX_SEATS};
+use crate::cards::{bit, relabel_card, relabel_set, suit, Card, CardSet, FULL_DECK, MAX_SEATS};
 use crate::knowledge::PublicKnowledge;
 use crate::legal::{legal_bids, legal_plays};
 use crate::prng::Rng;
@@ -240,6 +240,54 @@ impl RoundState {
     pub fn is_done(&self) -> bool {
         self.phase == Phase::Done
     }
+
+    /// Cyclic seat relabeling by `k`: seat `s` becomes `(s + k) mod P`
+    /// (§3.5). Seat-indexed arrays are rotated; seat-valued fields are
+    /// incremented; position-indexed data (`trick_cards`, `led`, match
+    /// context) is untouched. Used by the seat-relabeling invariance test.
+    pub fn rotate_seats(&mut self, k: u8) {
+        let p = self.n_players as usize;
+        let k = (k as usize) % p;
+        if k == 0 {
+            return;
+        }
+        self.hands[..p].rotate_right(k);
+        self.bids[..p].rotate_right(k);
+        self.has_bid[..p].rotate_right(k);
+        self.tricks_won[..p].rotate_right(k);
+        self.public.played_by[..p].rotate_right(k);
+        self.public.voids[..p].rotate_right(k);
+        self.public.remaining_hand_size[..p].rotate_right(k);
+        let k8 = k as u8;
+        let p8 = self.n_players;
+        self.dealer = (self.dealer + k8) % p8;
+        self.actor = (self.actor + k8) % p8;
+        self.trick_leader = (self.trick_leader + k8) % p8;
+        for s in self.trick_seats.iter_mut() {
+            *s = (*s + k8) % p8;
+        }
+    }
+
+    /// Relabels every suit through `perm` (card axes, led suit, voids, played
+    /// sets). Seat identities and bids are untouched. Used by the suit-parity
+    /// property test (§5.4).
+    pub fn relabel_suits(&mut self, perm: &[u8; 4]) {
+        for h in self.hands.iter_mut() {
+            *h = relabel_set(*h, perm);
+        }
+        for c in self.trick_cards.iter_mut() {
+            *c = relabel_card(*c, perm);
+        }
+        self.led = self.led.map(|s| perm[s as usize]);
+        for s in self.public.played_by.iter_mut() {
+            *s = relabel_set(*s, perm);
+        }
+        self.public.all_played = relabel_set(self.public.all_played, perm);
+        for s in self.public.voids.iter_mut() {
+            *s = relabel_set(*s, perm);
+        }
+        self.public.undealt_possible = relabel_set(self.public.undealt_possible, perm);
+    }
 }
 
 #[cfg(test)]
@@ -416,5 +464,30 @@ mod tests {
         }
         // Seat 1 played card 1, so its remaining hand is exactly card 14.
         assert_eq!(poss[1], (1 << 14));
+    }
+
+    #[test]
+    fn relabeling_preserves_knowledge_validity() {
+        let mut rng = Rng::new(11);
+        for seed in 0..20u64 {
+            let mut g = RoundState::new(5, 4, seed as u8 % 5, seed, ScoringConfig::default());
+            // advance to a mid-game state
+            while !g.is_done() && rng.next_below(100) < 60 {
+                let mask = match g.phase {
+                    Phase::Bidding => g.legal_bid_mask(g.actor) as u64,
+                    Phase::Playing => g.legal_play_mask(g.actor),
+                    Phase::Done => unreachable!(),
+                };
+                g.step(mask.trailing_zeros() as u8);
+            }
+            let k = 1 + (seed as u8 % 4);
+            let mut a = g.clone();
+            a.rotate_seats(k);
+            assert!(a.public.is_valid(5, 4));
+            assert_eq!(a.actor, (g.actor + k) % 5);
+            let mut b = g.clone();
+            b.relabel_suits(&[1, 0, 3, 2]);
+            assert!(b.public.is_valid(5, 4));
+        }
     }
 }
