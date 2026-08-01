@@ -103,6 +103,20 @@ impl Batch {
         Self { games, match_ctx }
     }
 
+    /// Owned `Batch` from slices (clones; the `Rollout` uses slice encoding
+    /// directly and avoids this).
+    pub fn from_parts(games: &[RoundState], match_ctx: &[MatchContext]) -> Self {
+        assert_eq!(
+            games.len(),
+            match_ctx.len(),
+            "games/match_ctx length mismatch"
+        );
+        Self {
+            games: games.to_vec(),
+            match_ctx: match_ctx.to_vec(),
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.games.len()
     }
@@ -135,15 +149,31 @@ pub fn encode_one(g: &RoundState, m: &MatchContext, out: &mut [i16]) -> usize {
 /// Encodes a whole batch in parallel (§3.6): pre-allocated `[B, K_MAX]` index
 /// buffer plus one length per game, zero allocation per step.
 pub fn encode_batch(batch: &Batch, out_idx: &mut [i16], out_len: &mut [u16]) {
-    assert_eq!(out_idx.len(), batch.len() * K_MAX, "out_idx wrong size");
-    assert_eq!(out_len.len(), batch.len(), "out_len wrong size");
+    encode_batch_ref(&batch.games, &batch.match_ctx, out_idx, out_len);
+}
+
+/// Slice-level `encode_batch`, used by the `Batch` wrapper and by the lockstep
+/// `Rollout` (which owns its games directly).
+pub fn encode_batch_ref(
+    games: &[RoundState],
+    match_ctx: &[MatchContext],
+    out_idx: &mut [i16],
+    out_len: &mut [u16],
+) {
+    assert_eq!(
+        games.len(),
+        match_ctx.len(),
+        "games/match_ctx length mismatch"
+    );
+    assert_eq!(out_idx.len(), games.len() * K_MAX, "out_idx wrong size");
+    assert_eq!(out_len.len(), games.len(), "out_len wrong size");
     use rayon::prelude::*;
     out_idx
         .par_chunks_mut(K_MAX)
         .zip(out_len.par_iter_mut())
         .enumerate()
         .for_each(|(g, (slot, len))| {
-            *len = encode_one(&batch.games[g], &batch.match_ctx[g], slot) as u16;
+            *len = encode_one(&games[g], &match_ctx[g], slot) as u16;
         });
 }
 
@@ -324,12 +354,11 @@ impl Enc<'_> {
         let remaining = self.g.n_cards as usize - self.g.tricks_played as usize;
         self.push(1065 + 6 + 11 + 10 + remaining);
         // phase.
-        let phase = match self.g.phase {
-            Phase::Bidding => 0,
-            Phase::Playing => 1,
-            Phase::Done => 2, // never encoded while a decision is pending
-        };
-        self.push(1065 + 6 + 11 + 10 + 11 + phase);
+        match self.g.phase {
+            Phase::Bidding => self.push(1065 + 38),
+            Phase::Playing => self.push(1065 + 38 + 1),
+            Phase::Done => {} // never encoded: no decision is pending
+        }
     }
 
     fn emit_match_ctx(&mut self) {

@@ -11,6 +11,10 @@
 //! Phase 2: the batch feature encoder (`encode`) over the layout registry,
 //! with actor-relative seat indexing, the `MatchContext`, and the
 //! suit-permutation / seat-relabeling invariance property tests.
+//!
+//! Phase 3: the lockstep bulk driver (`rollout`) that plays `batch` games in
+//! parallel and exposes the per-step tensors the trainer consumes, plus the
+//! PyO3 bridge (`plump-py`) with in-place, pinned-buffer buffer exchange.
 
 pub mod cards;
 pub mod encode;
@@ -19,6 +23,7 @@ pub mod knowledge;
 pub mod layout;
 pub mod legal;
 pub mod prng;
+pub mod rollout;
 pub mod scoring;
 pub mod search;
 
@@ -28,5 +33,6 @@ pub use game::{Phase, RoundState};
 pub use knowledge::PublicKnowledge;
 pub use layout::{Block, SuitRule, N_FEATURES, N_PERMUTATIONS};
 pub use prng::Rng;
+pub use rollout::Rollout;
 pub use scoring::ScoringConfig;
 pub use search::{dd_play, dd_scores, DdResult};
