@@ -11,7 +11,7 @@
 //! All games share `(P, C)` and the same decision count `D = P·(P... )`,
 //! actually `D = P * (1 + C)` (§3.2), so the batch is fully lockstep.
 
-use crate::cards::{CardSet, MAX_SEATS};
+use crate::cards::{bit, CardSet, MAX_SEATS};
 use crate::encode::{encode_batch_ref, MatchContext};
 use crate::game::{Phase, RoundState};
 use crate::prng::Rng;
@@ -134,6 +134,38 @@ impl Rollout {
         &self.scores[g * MAX_SEATS..g * MAX_SEATS + self.n_players as usize]
     }
 
+    /// Final trick count per seat for game `g` (valid once `round_over()`).
+    pub fn round_tricks(&self, g: usize) -> [u8; MAX_SEATS] {
+        self.games[g].tricks_won
+    }
+
+    /// Belief targets for the current state (§5.3): for every card `c`, the
+    /// actor-relative class — `0..P-1` = the rel seat holding it, `6` = played,
+    /// `7` = in the dead stock. Ground truth from the deal; recomputed at
+    /// every step so a played card flips to `PLAYED`.
+    pub fn belief_targets(&self, out: &mut [u8]) {
+        assert_eq!(out.len(), self.batch * 52, "belief target buffer too small");
+        for g in 0..self.batch {
+            let game = &self.games[g];
+            let actor = game.actor;
+            for (c, slot) in out[g * 52..(g + 1) * 52].iter_mut().enumerate() {
+                let b = bit(c as u8);
+                if game.public.all_played & b != 0 {
+                    *slot = 6; // PLAYED
+                } else {
+                    let mut cls = 7; // UNDEALT
+                    for p in 0..game.n_players {
+                        if game.hands[p as usize] & b != 0 {
+                            cls = (p + game.n_players - actor) % game.n_players;
+                            break;
+                        }
+                    }
+                    *slot = cls;
+                }
+            }
+        }
+    }
+
     /// Re-deals every game for a new round; resets scores and the step
     /// counter. Returns the number of rounds dealt.
     pub fn reset(&mut self, seed: u64) -> usize {
@@ -244,6 +276,52 @@ mod tests {
         assert!(before != after, "reset should re-deal");
         assert_eq!(r.step, 0);
         assert_eq!(r.rounds_dealt, 2);
+    }
+
+    #[test]
+    fn belief_targets_cover_all_classes() {
+        let mut r = Rollout::new(3, 2, 8, 3, ScoringConfig::default());
+        let d = r.decisions_per_round();
+        let mut out = vec![0u8; 8 * 52];
+        for t in 0..d {
+            r.belief_targets(&mut out);
+            for g in 0..8 {
+                let game = r.game(g);
+                let actor = game.actor;
+                for (c, &cls) in out[g * 52..g * 52 + 52].iter().enumerate() {
+                    let b = bit(c as u8);
+                    if game.public.all_played & b != 0 {
+                        assert_eq!(cls, 6, "played card must be PLAYED");
+                    } else if game.hands[actor as usize] & b != 0 {
+                        assert_eq!(cls, 0, "own card must be rel seat 0");
+                    } else {
+                        // every unseen card is held by exactly one rel seat
+                        let mut holders = 0;
+                        for p in 0..3 {
+                            if game.hands[p as usize] & b != 0 {
+                                let rel = (p + 3 - actor) % 3;
+                                assert_eq!(cls, rel, "mismatched holder at t={t} g={g}");
+                                holders += 1;
+                            }
+                        }
+                        if holders == 0 {
+                            assert_eq!(cls, 7, "dead stock must be UNDEALT");
+                        }
+                    }
+                }
+            }
+            let mut actions = vec![0u8; 8];
+            for (g, a) in actions.iter_mut().enumerate() {
+                let mask = if r.is_bid(g) {
+                    r.legal_bid(g) as u64
+                } else {
+                    r.legal_play(g)
+                };
+                *a = mask.trailing_zeros() as u8;
+            }
+            r.step(&actions);
+        }
+        assert!(r.round_over());
     }
 
     #[test]

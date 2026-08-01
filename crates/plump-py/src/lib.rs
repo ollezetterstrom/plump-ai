@@ -208,6 +208,31 @@ impl Rollout {
     fn round_scores(&self, g: usize) -> Vec<i32> {
         self.inner.round_scores(g).to_vec()
     }
+
+    /// Final trick count per seat for game `g` (valid once `round_over()`).
+    fn tricks(&self, g: usize) -> Vec<i32> {
+        self.inner.round_tricks(g)[..self.inner.n_players as usize]
+            .iter()
+            .map(|&t| t as i32)
+            .collect()
+    }
+
+    /// Fills `[B * 52]` u8 with the current belief targets (§5.3).
+    fn belief_targets(&self, py: Python<'_>, mut out: PyReadwriteArray1<'_, u8>) -> PyResult<()> {
+        let b = self.inner.batch;
+        let slice = out
+            .as_slice_mut()
+            .map_err(|_| PyValueError::new_err("out must be a C-contiguous array"))?;
+        if slice.len() != b * 52 {
+            return Err(PyValueError::new_err(format!(
+                "belief target buffer must be {} entries, got {}",
+                b * 52,
+                slice.len()
+            )));
+        }
+        py.allow_threads(|| self.inner.belief_targets(slice));
+        Ok(())
+    }
 }
 
 #[pymodule]

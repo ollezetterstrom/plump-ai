@@ -104,6 +104,24 @@ class RolloutDriver:
         """(legal_bid u16, legal_play u64, is_bid u8) for the current state."""
         return self.legal_bid, self.legal_play, self.is_bid
 
+    def legal_bool(self) -> np.ndarray:
+        """`[B, 52]` bool legal-action mask (§3.4): bid bits in 0..=C, else the
+        52-bit play mask."""
+        bid, play, is_bid = self.masks()
+        bid_bits = self._unpack_bits(bid, self.n_cards + 1)
+        play_bits = self._unpack_bits(play, 52)
+        legal = play_bits.copy()
+        legal[:, : self.n_cards + 1] = np.where(
+            (is_bid != 0)[:, None], bid_bits, legal[:, : self.n_cards + 1]
+        )
+        return legal
+
+    def belief_targets(self) -> np.ndarray:
+        """`[B, 52]` u8 ground-truth belief targets (§5.3), actor-relative."""
+        out = np.zeros(self.batch * 52, dtype=np.uint8)
+        self.engine.belief_targets(out)
+        return out.reshape(self.batch, 52)
+
     def reset(self, seed: int):
         self._join()
         self.engine.reset(seed)
@@ -127,6 +145,9 @@ class RolloutDriver:
 
     def round_scores(self, g: int):
         return self.engine.round_scores(g)
+
+    def tricks(self, g: int):
+        return self.engine.tricks(g)
 
     def play_random(self, rng: np.random.Generator | None = None) -> None:
         """Samples uniformly over legal actions for every game and steps once."""

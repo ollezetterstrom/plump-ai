@@ -17,8 +17,10 @@ Milestones track the phases in the [master plan](original%20plan/plan.md) (§11)
 
 ## Current focus
 
-**Phase 4 — network + PPO trainer.** Build the training loop on top of the Phase 3 rollout:
-per-seat terminal returns (§4.1), the categorical value head with the trick-count
-factorization (§4.2), the disjoint bid/play policy heads (§5.1), the belief head (§5.3),
-and a minibatch update over the `[D, B, K_MAX]` trajectory tensors. Exit: beats random by
-> 8 pts/round and a hand-coded heuristic on `P=4, C=5`.
+**Phase 4 — network + PPO trainer.** The trainer is implemented
+(`python/plump/train.py`): fixed-shape `[D, B, K_MAX]` trajectory buffers, per-seat
+terminal MC returns (§4.1), categorical value head with trick-count factorization (§4.2),
+disjoint bid/play heads (§5.1), belief CE (§5.3), approx-KL early stop, entropy floor,
+and duplicate-deal eval vs. random and the heuristic baseline (`python/plump/heuristic.py`).
+Remaining: tune the coefficients/annealing schedule and iterate until the exit is met —
+beats random by > 8 pts/round and a hand-coded heuristic on `P=4, C=5`.

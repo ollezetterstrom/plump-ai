@@ -1,25 +1,31 @@
-# PPO trainer skeleton (§4).
+# PPO trainer (§4).
 #
-# Phase 4+ material. This module fixes the structure and the loss math from
-# §4.1–§4.3; the rollout loop is wired once the Rust engine bridge lands.
+# Rolls out `B` games in lockstep through the Rust engine (Phase 3 bridge),
+# stores the fixed-shape §7.3 trajectory buffers, and applies the §4.3 PPO
+# objective: disjoint bid/play heads, categorical value with trick-count
+# factorization (§4.2), belief CE over ground-truth targets (§5.3), per-seat
+# terminal MC returns with normalized advantages (§4.1), approx-KL early
+# stopping, and an entropy floor.
 #
-# Key contracts enforced here when implemented:
-#   * per-seat trajectory attribution (§4.1): returns are per-seat scalars,
-#     no cross-seat GAE;
-#   * distributional value CE + trick-count factorization (§4.2);
-#   * disjoint bid/play heads selected by phase (§4.3), `-1e30` masking;
-#   * approx-KL early stopping and an entropy floor (§4.3).
+# Run a short training loop + duplicate-deal eval with:
+#   python -m plump.train --iters 5 --batch 512 --players 4 --cards 5
 
+import argparse
+import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
 from . import config
 from .net import PlumpNet
+from .rollout import RolloutDriver
 
 EPS = 1e-8
+_PLAYED = 6  # belief class: card already played (§5.3)
+_UNDEALT = 7  # belief class: card in the dead stock
 
 
 @dataclass
@@ -31,7 +37,7 @@ class PolicyLosses:
     belief_ce: torch.Tensor
     entropy: torch.Tensor
     total: torch.Tensor
-    approx_kl: Optional[torch.Tensor]
+    approx_kl: torch.Tensor
 
 
 def _select_logits(net_outputs: dict, is_bid: torch.Tensor) -> torch.Tensor:
@@ -50,11 +56,15 @@ def _select_logits(net_outputs: dict, is_bid: torch.Tensor) -> torch.Tensor:
     return logits
 
 
-def _logp_ratio(logits: torch.Tensor, action: torch.Tensor, legal: torch.Tensor,
-                old_logp: torch.Tensor) -> torch.Tensor:
+def _masked_logp(logits: torch.Tensor, action: torch.Tensor,
+                 legal: torch.Tensor) -> torch.Tensor:
     masked = logits.masked_fill(~legal, -1e30)
-    logp = torch.log_softmax(masked, -1).gather(-1, action.unsqueeze(-1)).squeeze(-1)
-    return (logp - old_logp).exp()
+    return torch.log_softmax(masked, -1).gather(-1, action.unsqueeze(-1)).squeeze(-1)
+
+
+def _approx_kl(new_logp: torch.Tensor, old_logp: torch.Tensor) -> torch.Tensor:
+    ratio = (new_logp - old_logp).exp()
+    return (ratio - 1 - (new_logp - old_logp)).mean()
 
 
 def compute_policy_loss(
@@ -69,12 +79,14 @@ def compute_policy_loss(
     trick_tgt: torch.Tensor,
     belief_tgt: torch.Tensor,
     post_bid: torch.Tensor,
+    bid: torch.Tensor,
     cfg: config.PpoConfig,
     entropy_coef: float,
 ) -> PolicyLosses:
     """PPO objective from §4.3 with all auxiliary losses gradient-scaled."""
     logits = _select_logits(net_outputs, is_bid)
-    ratio = _logp_ratio(logits, action, legal, old_logp)
+    new_logp = _masked_logp(logits, action, legal)
+    ratio = (new_logp - old_logp).exp()
     adv = ret - net.value(net_outputs["value"])
     adv = (adv - adv.mean()) / (adv.std() + EPS)
 
@@ -86,23 +98,17 @@ def compute_policy_loss(
     value_ce = F.cross_entropy(net_outputs["value"], atom_idx)
     trick_ce = F.cross_entropy(net_outputs["tricks"], trick_tgt)
 
-    # Belief CE computed only over genuinely uncertain cards (≥2 legal
-    # classes) — the loss is masked to those positions (§5.3).
     belief_ce = _belief_ce(net, net_outputs["belief"], belief_tgt)
 
-    # Post-bid factored value consistency: ||V - sum_t p(t)*score(bid,t)||².
+    # Post-bid factored value consistency: ||V - sum_t p(t)*score(bid,t)||² (§4.2).
     value_consistency = torch.tensor(0.0, device=adv.device)
     if post_bid.any():
         pb = post_bid
         p_tricks = torch.softmax(net_outputs["tricks"][pb], -1)  # [n, 11]
-        # V_factored = sum_t p(t) * score_table[bid][t]; bid is the action id.
-        bid = action[pb].to(torch.long)
-        v_factored = (p_tricks * net.score_table[bid]).sum(-1)
-        value_consistency = F.mse_loss(
-            net.value(net_outputs["value"][pb]), v_factored)
+        v_factored = (p_tricks * net.score_table[bid[pb]]).sum(-1)
+        value_consistency = F.mse_loss(net.value(net_outputs["value"][pb]), v_factored)
 
-    ent = net.entropy(logits, legal).mean()
-    ent = ent.clamp(min=cfg.entropy_floor)
+    ent = net.entropy(logits, legal).mean().clamp(min=cfg.entropy_floor)
 
     total = (
         policy_loss
@@ -113,31 +119,45 @@ def compute_policy_loss(
         - entropy_coef * ent
     )
 
-    with torch.no_grad():
-        # approx-KL needs the new logp of the sampled action, which is
-        # available during `update()`; computed there for early stopping.
-        approx_kl = None
-
-    return PolicyLosses(policy=policy_loss, value_ce=value_ce,
-                        value_consistency=value_consistency, trick_ce=trick_ce,
-                        belief_ce=belief_ce, entropy=ent, total=total,
-                        approx_kl=approx_kl)
+    return PolicyLosses(
+        policy=policy_loss,
+        value_ce=value_ce,
+        value_consistency=value_consistency,
+        trick_ce=trick_ce,
+        belief_ce=belief_ce,
+        entropy=ent,
+        total=total,
+        approx_kl=_approx_kl(new_logp, old_logp),
+    )
 
 
 def _belief_ce(net: PlumpNet, belief_logits: torch.Tensor,
                belief_tgt: torch.Tensor) -> torch.Tensor:
-    # Phase 5: mask to uncertain cards via the engine's PublicKnowledge.
-    # Skeleton returns the plain mean; the mask lands with the engine bridge.
     b, _ = belief_logits.shape
     logits = belief_logits.view(b, 52, net.n_belief_classes)
     return F.cross_entropy(logits.permute(0, 2, 1), belief_tgt)
 
 
-class PPOTrainer:
-    """Stages the fixed-shape buffers from §7.3 and the update loop from §4.
+def _gumbel_sample(logits: torch.Tensor) -> torch.Tensor:
+    """Exact categorical sampling without `torch.multinomial` (gaps on MPS)."""
+    u = torch.rand(logits.shape, device=logits.device).clamp(EPS, 1.0)
+    g = -torch.log(-torch.log(u))
+    return (logits + g).argmax(-1)
 
-    Not runnable until the engine bridge provides `plump.env` rollouts.
-    """
+
+def sample_actions(net: PlumpNet, obs: torch.Tensor, legal: torch.Tensor,
+                   is_bid: torch.Tensor, device: str) -> tuple[torch.Tensor, torch.Tensor]:
+    """Samples an action and logp from the current policy under the legal mask."""
+    with torch.no_grad():
+        out = net(obs)
+        logits = _select_logits(out, is_bid).masked_fill(~legal, -1e30)
+        action = _gumbel_sample(logits)
+        logp = _masked_logp(logits, action, legal)
+    return action, logp
+
+
+class PPOTrainer:
+    """Stages the fixed-shape §7.3 buffers and the §4 update loop."""
 
     def __init__(self, net: PlumpNet, env_cfg: config.EnvConfig,
                  ppo_cfg: config.PpoConfig, device: str):
@@ -147,33 +167,245 @@ class PPOTrainer:
         self.device = device
         self.opt = torch.optim.Adam(net.parameters(), lr=ppo_cfg.lr)
         self.rollout_len = (1 + env_cfg.n_cards) * env_cfg.n_players
+        self.iteration = 0
+        self.drv = RolloutDriver(
+            env_cfg.n_players, env_cfg.n_cards, env_cfg.batch, seed=env_cfg.seed
+        )
+        # atom index lookup: round score value -> column in the value head.
+        real = [a for a in net.score_atoms if a < 1_000]
+        self._max_atom = max(real)
+        lut = torch.zeros(self._max_atom + 1, dtype=torch.long)
+        for i, a in enumerate(net.score_atoms):
+            if a < 1_000:
+                lut[a] = i
+        self._atom_lut = lut
         self._alloc_buffers()
 
     def _alloc_buffers(self):
         # §7.3: pre-allocated once, fixed shapes, reused across iterations.
         D, B = self.rollout_len, self.env_cfg.batch
-        d = self.device
-        self.obs_idx = torch.zeros(D, B, config.K_MAX, dtype=torch.int16, device=d)
-        self.action = torch.zeros(D, B, dtype=torch.uint8, device=d)
-        self.old_logp = torch.zeros(D, B, dtype=torch.float16, device=d)
-        self.value = torch.zeros(D, B, dtype=torch.float16, device=d)
-        self.legal = torch.zeros(D, B, 52, dtype=torch.bool, device=d)
-        self.is_bid = torch.zeros(D, B, dtype=torch.bool, device=d)
-        self.seat = torch.zeros(D, B, dtype=torch.uint8, device=d)
-        self.is_learner = torch.zeros(D, B, dtype=torch.bool, device=d)
-        self.ret = torch.zeros(D, B, dtype=torch.float32, device=d)
+        self.obs_idx = torch.zeros(D, B, config.K_MAX, dtype=torch.int16)
+        self.action = torch.zeros(D, B, dtype=torch.uint8)
+        self.old_logp = torch.zeros(D, B, dtype=torch.float32)
+        self.value = torch.zeros(D, B, dtype=torch.float32)
+        self.legal = torch.zeros(D, B, 52, dtype=torch.bool)
+        self.is_bid = torch.zeros(D, B, dtype=torch.bool)
+        self.seat = torch.zeros(D, B, dtype=torch.uint8)
+        self.ret = torch.zeros(D, B, dtype=torch.float32)
+        self.atom_idx = torch.zeros(D, B, dtype=torch.long)
+        self.trick_tgt = torch.zeros(D, B, dtype=torch.uint8)
+        self.post_bid = torch.zeros(D, B, dtype=torch.bool)
+        self.bid = torch.zeros(D, B, dtype=torch.uint8)
+        self.belief_tgt = torch.zeros(D, B, 52, dtype=torch.uint8)
 
     def rollout(self):
-        # Phase 4: one iteration of deal -> step x D -> per-seat MC returns
-        # (§4.1), opponent mixing K=2 (§4.4), suit relabeling (§4.5.1).
-        raise NotImplementedError("wired when the engine bridge lands")
+        """One iteration: deal -> D policy steps -> per-seat MC returns (§4.1)."""
+        drv = self.drv
+        net = self.net
+        D, B = self.rollout_len, self.env_cfg.batch
+        drv.reset(self.env_cfg.seed + self.iteration)
+        t0 = time.perf_counter()
+        for t in range(D):
+            idx, _ = drv.obs()
+            obs = torch.from_numpy(idx).to(self.device, dtype=torch.int64)
+            legal = torch.from_numpy(drv.legal_bool()).to(self.device)
+            is_bid = torch.from_numpy(drv.is_bid != 0).to(self.device)
+            with torch.no_grad():
+                out = net(obs)
+                logits = _select_logits(out, is_bid).masked_fill(~legal, -1e30)
+                action = _gumbel_sample(logits)
+                logp = _masked_logp(logits, action, legal)
+                value = net.value(out["value"])
+            self.obs_idx[t] = torch.from_numpy(idx)
+            self.action[t] = action.to("cpu")
+            self.old_logp[t] = logp.to("cpu")
+            self.value[t] = value.to("cpu")
+            self.legal[t] = legal.to("cpu")
+            self.is_bid[t] = is_bid.to("cpu")
+            self.seat[t] = torch.from_numpy(drv.actor)
+            self.belief_tgt[t] = torch.from_numpy(drv.belief_targets())
+            drv.step(action.cpu().numpy().astype(np.uint8))
+            drv.snapshot()
+
+        # Terminal per-seat returns (§4.1): R_p = score_p, broadcast to that
+        # seat's own decisions; no discounting, no cross-seat mixing.
+        scores = np.zeros((B, self.env_cfg.n_players), dtype=np.float32)
+        tricks = np.zeros((B, self.env_cfg.n_players), dtype=np.float32)
+        for g in range(B):
+            scores[g] = drv.round_scores(g)
+            tricks[g] = drv.tricks(g)
+        seats = self.seat.numpy()
+        g_idx = np.arange(B)
+        ret = torch.from_numpy(scores[g_idx[None, :], seats])  # [D, B]
+        trick_tgt = torch.from_numpy(tricks[g_idx[None, :], seats])
+        self.ret = ret
+        self.trick_tgt = trick_tgt.to(torch.uint8)
+        self.atom_idx = self._atom_lut[ret.long().clamp(0, self._max_atom)]
+        # Each seat bids once at rows 0..P-1 (actor == row); recover every
+        # row's own bid so the §4.2 factored value can use the real bid.
+        g_idx = torch.arange(B)
+        self.bid = self.action[: self.env_cfg.n_players][
+            self.seat.long().clamp(max=self.env_cfg.n_players - 1), g_idx[None, :]
+        ]
+        self.post_bid = ~self.is_bid
+        self.iteration += 1
+        return time.perf_counter() - t0
 
     def update(self):
-        # §4.3: 2 epochs x 8 minibatches, index-permutation shuffling
-        # (§7.3), approx-KL early stop at target_kl.
-        raise NotImplementedError("wired when the engine bridge lands")
+        """§4.3: epochs x minibatches, index-permutation shuffling, KL stop."""
+        cfg = self.ppo_cfg
+        D, B = self.rollout_len, self.env_cfg.batch
+        flat = D * B
+        obs_f = self.obs_idx.reshape(flat, -1)
+        action_f = self.action.reshape(flat)
+        legal_f = self.legal.reshape(flat, 52)
+        is_bid_f = self.is_bid.reshape(flat)
+        old_logp_f = self.old_logp.reshape(flat)
+        ret_f = self.ret.reshape(flat)
+        atom_f = self.atom_idx.reshape(flat)
+        trick_f = self.trick_tgt.reshape(flat)
+        belief_f = self.belief_tgt.reshape(flat, 52)
+        post_f = self.post_bid.reshape(flat)
+        bid_f = self.bid.reshape(flat)
+        mb = max(1, flat // cfg.minibatches)
+        perm = torch.randperm(flat)
+        d = self.device
+        total_kl = 0.0
+        n_updates = 0
+        for epoch in range(cfg.epochs):
+            for i in range(cfg.minibatches):
+                idx = perm[i * mb:(i + 1) * mb]
+                obs = obs_f[idx].to(d, dtype=torch.int64)
+                action = action_f[idx].to(d, dtype=torch.long)
+                legal = legal_f[idx].to(d)
+                is_bid = is_bid_f[idx].to(d)
+                old_logp = old_logp_f[idx].to(d)
+                ret = ret_f[idx].to(d)
+                atom = atom_f[idx].to(d)
+                trick = trick_f[idx].to(d)
+                belief = belief_f[idx].to(d, dtype=torch.long)
+                post = post_f[idx].to(d)
+                bid = bid_f[idx].to(d, dtype=torch.long)
+                out = self.net(obs)
+                loss = compute_policy_loss(
+                    self.net, out, is_bid, action, legal, old_logp, ret,
+                    atom, trick, belief, post, bid, cfg, cfg.entropy_coef,
+                )
+                self.opt.zero_grad()
+                loss.total.backward()
+                torch.nn.utils.clip_grad_norm_(self.net.parameters(), cfg.grad_clip)
+                self.opt.step()
+                kl = float(loss.approx_kl.item())
+                total_kl += kl
+                n_updates += 1
+            if total_kl / n_updates > cfg.target_kl:
+                break  # approx-KL early stopping (§4.3)
+        return total_kl / max(1, n_updates)
 
     def train(self, iterations: int):
-        for _ in range(iterations):
-            self.rollout()
-            self.update()
+        for it in range(iterations):
+            t_roll = self.rollout()
+            t_upd = time.perf_counter()
+            kl = self.update()
+            dt = time.perf_counter() - t_upd
+            print(
+                f"iter {self.iteration - 1}: rollout {t_roll * 1e3:.1f} ms, "
+                f"update {dt * 1e3:.1f} ms, approx-KL {kl:.4f}"
+            )
+            yield self.iteration - 1
+
+    def evaluate(self, n_games: int, seed: int = 0, baseline: str = "random") -> dict:
+        """Duplicate-deal eval (§9.1): the net and the baseline play identical
+        deals; report the mean per-seat round score of each."""
+        net_avg = _play_policy(self.net, self.env_cfg.n_players, self.env_cfg.n_cards,
+                               n_games, seed, self.device)
+        if baseline == "random":
+            base_avg = _play_random(self.env_cfg.n_players, self.env_cfg.n_cards,
+                                    n_games, seed)
+        elif baseline == "heuristic":
+            base_avg = _play_heuristic(self.env_cfg.n_players, self.env_cfg.n_cards,
+                                       n_games, seed)
+        else:
+            raise ValueError(baseline)
+        return {"net": net_avg, "baseline": base_avg,
+                "delta": net_avg - base_avg}
+
+
+# -- duplicate-deal evaluators -------------------------------------------------
+
+def _play_policy(net: PlumpNet, n_players: int, n_cards: int, n_games: int,
+                 seed: int, device: str) -> float:
+    drv = RolloutDriver(n_players, n_cards, n_games, seed=seed)
+    for _ in range(drv.decisions_per_round):
+        idx, _ = drv.obs()
+        obs = torch.from_numpy(idx).to(device, dtype=torch.int64)
+        legal = torch.from_numpy(drv.legal_bool()).to(device)
+        is_bid = torch.from_numpy(drv.is_bid != 0).to(device)
+        action, _ = sample_actions(net, obs, legal, is_bid, device)
+        drv.step(action.cpu().numpy().astype(np.uint8))
+        drv.snapshot()
+    return np.mean([drv.round_scores(g) for g in range(n_games)])
+
+
+def _play_random(n_players: int, n_cards: int, n_games: int, seed: int) -> float:
+    drv = RolloutDriver(n_players, n_cards, n_games, seed=seed)
+    rng = np.random.default_rng(seed + 1)
+    for _ in range(drv.decisions_per_round):
+        drv.play_random(rng)
+    return np.mean([drv.round_scores(g) for g in range(n_games)])
+
+
+def _play_heuristic(n_players: int, n_cards: int, n_games: int, seed: int) -> float:
+    drv = RolloutDriver(n_players, n_cards, n_games, seed=seed)
+    for _ in range(drv.decisions_per_round):
+        legal = drv.legal_bool()
+        is_bid = drv.is_bid != 0
+        actions = np.zeros(n_games, dtype=np.uint8)
+        for g in range(n_games):
+            row = legal[g]
+            if is_bid[g]:
+                actions[g] = int(np.nonzero(row[: n_cards + 1])[0][0])  # lowest bid
+            else:
+                actions[g] = int(np.nonzero(row)[0][0])  # lowest legal card
+        drv.step(actions)
+        drv.snapshot()
+    return np.mean([drv.round_scores(g) for g in range(n_games)])
+
+
+def _default_device() -> str:
+    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def main(argv: Optional[list[str]] = None):
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--iters", type=int, default=5)
+    ap.add_argument("--batch", type=int, default=512)
+    ap.add_argument("--players", type=int, default=4)
+    ap.add_argument("--cards", type=int, default=5)
+    ap.add_argument("--eval-games", type=int, default=2048)
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--device", default=_default_device())
+    args = ap.parse_args(argv)
+
+    env_cfg = config.EnvConfig(
+        n_players=args.players, n_cards=args.cards, batch=args.batch, seed=args.seed
+    )
+    net = PlumpNet()
+    trainer = PPOTrainer(net, env_cfg, config.PpoConfig(), args.device)
+    t0 = time.perf_counter()
+    for _ in trainer.train(args.iters):
+        pass
+    print(f"training took {time.perf_counter() - t0:.1f}s")
+
+    ev = trainer.evaluate(args.eval_games, seed=args.seed, baseline="random")
+    print(f"eval vs random: net {ev['net']:.2f} vs random {ev['baseline']:.2f}"
+          f" pts/round (delta {ev['delta']:+.2f})")
+    ev = trainer.evaluate(args.eval_games, seed=args.seed, baseline="heuristic")
+    print(f"eval vs heuristic: net {ev['net']:.2f} vs heuristic {ev['baseline']:.2f}"
+          f" pts/round (delta {ev['delta']:+.2f})")
+
+
+if __name__ == "__main__":
+    main()
