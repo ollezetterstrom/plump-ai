@@ -52,6 +52,22 @@ def test_update_runs_and_kl_finite():
     assert kl >= 0
 
 
+def test_checkpoint_roundtrip(tmp_path):
+    tr = _trainer()
+    tr.rollout()
+    tr.update()
+    path = tmp_path / "ck.pt"
+    tr.save_checkpoint(path)
+    net_before = [p.detach().clone() for p in tr.net.parameters()]
+
+    tr2 = _trainer()
+    assert tr2.iteration == 0
+    tr2.load_checkpoint(path)
+    assert tr2.iteration == tr.iteration
+    for a, b in zip(tr2.net.parameters(), net_before):
+        assert torch.allclose(a, b)
+
+
 def test_select_logits_disjoint_heads():
     from plump.net import PlumpNet
 

@@ -13,6 +13,7 @@
 import argparse
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Optional
 
 import numpy as np
@@ -20,6 +21,7 @@ import torch
 import torch.nn.functional as F
 
 from . import config
+from .heuristic import play_heuristic
 from .net import PlumpNet
 from .rollout import RolloutDriver
 
@@ -168,6 +170,10 @@ class PPOTrainer:
         self.opt = torch.optim.Adam(net.parameters(), lr=ppo_cfg.lr)
         self.rollout_len = (1 + env_cfg.n_cards) * env_cfg.n_players
         self.iteration = 0
+        self.last_kl = 0.0
+        self.last_entropy = 0.0
+        self.kl_early_stop = False  # update() cut short by approx-KL
+        self.entropy_history: list[float] = []
         self.drv = RolloutDriver(
             env_cfg.n_players, env_cfg.n_cards, env_cfg.batch, seed=env_cfg.seed
         )
@@ -205,6 +211,7 @@ class PPOTrainer:
         D, B = self.rollout_len, self.env_cfg.batch
         drv.reset(self.env_cfg.seed + self.iteration)
         t0 = time.perf_counter()
+        ent_acc = 0.0
         for t in range(D):
             idx, _ = drv.obs()
             obs = torch.from_numpy(idx).to(self.device, dtype=torch.int64)
@@ -216,6 +223,7 @@ class PPOTrainer:
                 action = _gumbel_sample(logits)
                 logp = _masked_logp(logits, action, legal)
                 value = net.value(out["value"])
+            ent_acc += net.entropy(logits, legal).mean().item()
             self.obs_idx[t] = torch.from_numpy(idx)
             self.action[t] = action.to("cpu")
             self.old_logp[t] = logp.to("cpu")
@@ -249,6 +257,8 @@ class PPOTrainer:
         ]
         self.post_bid = ~self.is_bid
         self.iteration += 1
+        self.last_entropy = ent_acc / D
+        self.entropy_history.append(self.last_entropy)
         return time.perf_counter() - t0
 
     def update(self):
@@ -272,6 +282,7 @@ class PPOTrainer:
         d = self.device
         total_kl = 0.0
         n_updates = 0
+        expected = cfg.epochs * cfg.minibatches
         for epoch in range(cfg.epochs):
             for i in range(cfg.minibatches):
                 idx = perm[i * mb:(i + 1) * mb]
@@ -300,18 +311,72 @@ class PPOTrainer:
                 n_updates += 1
             if total_kl / n_updates > cfg.target_kl:
                 break  # approx-KL early stopping (§4.3)
-        return total_kl / max(1, n_updates)
+        self.kl_early_stop = n_updates < expected
+        self.last_kl = total_kl / max(1, n_updates)
+        return self.last_kl
 
-    def train(self, iterations: int):
+    def save_checkpoint(self, path: Path | str):
+        """Crash-safe snapshot: net + opt + iteration (buffers are re-derived)."""
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "net": self.net.state_dict(),
+                "opt": self.opt.state_dict(),
+                "iteration": self.iteration,
+            },
+            path,
+        )
+
+    def load_checkpoint(self, path: Path | str):
+        """Resumes from a `save_checkpoint` snapshot."""
+        ck = torch.load(path, map_location=self.device, weights_only=True)
+        self.net.load_state_dict(ck["net"])
+        self.opt.load_state_dict(ck["opt"])
+        self.iteration = int(ck["iteration"])
+        print(f"resumed from {path} (iteration {self.iteration})")
+
+    def train(self, iterations: int, eval_every: int = 0,
+              stall_limit: int = 3, save_dir: Path | str = "checkpoints",
+              eval_games: int = 2048):
+        save_dir = Path(save_dir)
+        best_delta: float | None = None
+        stalled = 0
         for it in range(iterations):
             t_roll = self.rollout()
             t_upd = time.perf_counter()
             kl = self.update()
             dt = time.perf_counter() - t_upd
+            flags = []
+            if self.kl_early_stop:
+                flags.append("KL-STOP")
+            if self.last_entropy < self.ppo_cfg.entropy_floor + 1e-3:
+                flags.append("ENTROPY-COLLAPSED")
             print(
                 f"iter {self.iteration - 1}: rollout {t_roll * 1e3:.1f} ms, "
-                f"update {dt * 1e3:.1f} ms, approx-KL {kl:.4f}"
+                f"update {dt * 1e3:.1f} ms, approx-KL {kl:.4f}, "
+                f"entropy {self.last_entropy:.4f}{(' [' + ', '.join(flags) + ']') if flags else ''}"
             )
+            self.save_checkpoint(save_dir / "latest.pt")
+            if eval_every > 0 and self.iteration % eval_every == 0:
+                ev = self.evaluate(eval_games, seed=self.env_cfg.seed, baseline="random")
+                delta = ev["delta"]
+                improved = best_delta is None or delta > best_delta + 0.1
+                if improved:
+                    best_delta = delta
+                    stalled = 0
+                    self.save_checkpoint(save_dir / "best.pt")
+                else:
+                    stalled += 1
+                print(
+                    f"  eval[{self.iteration}]: net {ev['net']:.2f} vs random "
+                    f"{ev['baseline']:.2f} pts/round (delta {delta:+.2f}, "
+                    f"best {best_delta:+.2f})"
+                )
+                if stalled >= stall_limit:
+                    print(f"  stopping: net-vs-random delta flat for {stalled} "
+                          f"consecutive evals (best {best_delta:+.2f})")
+                    break
             yield self.iteration - 1
 
     def evaluate(self, n_games: int, seed: int = 0, baseline: str = "random") -> dict:
@@ -323,8 +388,8 @@ class PPOTrainer:
             base_avg = _play_random(self.env_cfg.n_players, self.env_cfg.n_cards,
                                     n_games, seed)
         elif baseline == "heuristic":
-            base_avg = _play_heuristic(self.env_cfg.n_players, self.env_cfg.n_cards,
-                                       n_games, seed)
+            base_avg = play_heuristic(self.env_cfg.n_players, self.env_cfg.n_cards,
+                                      n_games, seed)
         else:
             raise ValueError(baseline)
         return {"net": net_avg, "baseline": base_avg,
@@ -355,29 +420,6 @@ def _play_random(n_players: int, n_cards: int, n_games: int, seed: int) -> float
     return np.mean([drv.round_scores(g) for g in range(n_games)])
 
 
-def _play_heuristic(n_players: int, n_cards: int, n_games: int, seed: int) -> float:
-    drv = RolloutDriver(n_players, n_cards, n_games, seed=seed)
-    for _ in range(drv.decisions_per_round):
-        legal = drv.legal_bool()
-        is_bid = drv.is_bid != 0
-        actions = np.zeros(n_games, dtype=np.uint8)
-        for g in range(n_games):
-            row = legal[g]
-            if is_bid[g]:
-                actions[g] = int(np.nonzero(row[: n_cards + 1])[0][0])  # lowest bid
-            else:
-                actions[g] = int(np.nonzero(row)[0][0])  # lowest legal card
-        drv.step(actions)
-        drv.snapshot()
-    return np.mean([drv.round_scores(g) for g in range(n_games)])
-
-
-def _default_device() -> str:
-    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
-        return "mps"
-    return "cpu"
-
-
 def main(argv: Optional[list[str]] = None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--iters", type=int, default=5)
@@ -386,7 +428,14 @@ def main(argv: Optional[list[str]] = None):
     ap.add_argument("--cards", type=int, default=5)
     ap.add_argument("--eval-games", type=int, default=2048)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--device", default=_default_device())
+    ap.add_argument("--device", default=config.default_device())
+    ap.add_argument("--save-dir", default="checkpoints")
+    ap.add_argument("--resume", action="store_true",
+                    help="resume from --save-dir/latest.pt")
+    ap.add_argument("--eval-every", type=int, default=0,
+                    help="eval vs random every N iters (0 = only at the end)")
+    ap.add_argument("--stall", type=int, default=3,
+                    help="stop after this many evals without net-vs-random progress")
     args = ap.parse_args(argv)
 
     env_cfg = config.EnvConfig(
@@ -394,10 +443,15 @@ def main(argv: Optional[list[str]] = None):
     )
     net = PlumpNet()
     trainer = PPOTrainer(net, env_cfg, config.PpoConfig(), args.device)
+    if args.resume:
+        trainer.load_checkpoint(Path(args.save_dir) / "latest.pt")
     t0 = time.perf_counter()
-    for _ in trainer.train(args.iters):
+    for _ in trainer.train(args.iters, eval_every=args.eval_every,
+                           stall_limit=args.stall, save_dir=args.save_dir,
+                           eval_games=args.eval_games):
         pass
     print(f"training took {time.perf_counter() - t0:.1f}s")
+    trainer.save_checkpoint(Path(args.save_dir) / "latest.pt")
 
     ev = trainer.evaluate(args.eval_games, seed=args.seed, baseline="random")
     print(f"eval vs random: net {ev['net']:.2f} vs random {ev['baseline']:.2f}"
