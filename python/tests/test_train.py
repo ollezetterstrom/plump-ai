@@ -49,7 +49,9 @@ def test_update_runs_and_kl_finite():
     tr.rollout()
     kl = tr.update()
     assert np.isfinite(kl)
-    assert kl >= 0
+    # Approx-KL of a fresh net after one tiny minibatch is ~1e-7; the float32
+    # estimator can cancel to a small negative blip (torch-version dependent).
+    assert kl >= -1e-3
 
 
 def test_checkpoint_roundtrip(tmp_path):
