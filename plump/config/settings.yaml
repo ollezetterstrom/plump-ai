@@ -1,0 +1,11 @@
+# plump/config/settings.yaml — editable, versioned
+train:
+  episodes: 1000000
+  batch_size: 512
+  lr: 0.00025
+  learn_every: 8
+  eval_every: 1000
+  eval_games: 500
+house:
+  zero_bid_points: 5
+  leader_earliest_highest: true

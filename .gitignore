@@ -1,0 +1,29 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+build/
+dist/
+
+# Plump models - too large for git, use releases
+*.pt
+*.pth
+*.ckpt
+*.npz
+checkpoints/
+ckpts/
+wandb/
+runs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp
+*.log
+*.tmp
