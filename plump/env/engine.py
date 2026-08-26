@@ -29,6 +29,9 @@ class PlumpEnv:
         self.played_cards: set[tuple[str, int]] = set()
         # void_matrix[player][suit_idx] = True once proven void
         self.void_matrix: list[list[bool]] = [[False] * 4 for _ in range(self.num_players)]
+        # history for tokenizer — ordered events (kind, player, payload)
+        # kind: "bid" -> payload int, "play" -> payload card tuple
+        self.history: list[tuple[str, int, object]] = []
 
     # -- setup --
     def new_round(self, round_cards: int = 10) -> None:
@@ -41,6 +44,7 @@ class PlumpEnv:
         self.bids = [-1] * self.num_players
         self.tricks_won = [0] * self.num_players
         self.void_matrix = [[False] * 4 for _ in range(self.num_players)]
+        self.history = []
 
         deck = [(s, v) for s in self.SUITS for v in range(2, 15)]
         random.shuffle(deck)
@@ -85,6 +89,10 @@ class PlumpEnv:
                 return i
         return 0
 
+    # -- helpers to record history (decoupled from logic) --
+    def record_bid(self, player: int, bid: int) -> None:
+        self.history.append(("bid", player, bid))
+
     # -- mutations --
     def play_card(self, player: int, card: tuple[str, int]) -> None:
         if self.led_suit == "":
@@ -93,6 +101,7 @@ class PlumpEnv:
             self.void_matrix[player][SUIT_INDEX[self.led_suit]] = True
         self.hands[player].remove(card)
         self.table.append((player, card))
+        self.history.append(("play", player, card))
 
     def resolve_trick(self) -> tuple[int, list[tuple[int, tuple[str, int]]]]:
         if not self.table:

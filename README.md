@@ -1,48 +1,33 @@
-# Plump V2 — House Rules, Clean Architecture
+﻿# Plump V2 — House Rules, Clean Architecture (Restart)
 
-**House v2:** `0-bid = 5pts` (not 10), `highest bidder (earliest tie) leads`.
-Tested on `RX 9060 XT` — `35 eps/s → ~630k /5h`.
+**House v2:** `0-bid = 5pts`, `highest bidder (earliest tie) leads`.
 
-## Structure (vibe-proof, decoupled)
+## Two training paths
+
+- `python -u train.py` — **DQN compat** (old 278/294). Resumes `plump_*_v2.pt`, ~630k/5h. Keeps your saves. Fine-tune for house rules, but will plateau.
+- `python -u train_transformer.py` — **Restart, correct long-term**: `Transformer + DMC + league` (FableDan/DanLM style). Starts from scratch, `league` includes `champion/best_v2.pt` as frozen sparring partners + random. ~`200k` budget, then keep running. This is the one that keeps getting smarter for weeks.
+
+Both use `plump/env/engine.py:105` house rules and `plump/` decoupled structure.
+
+## Structure (vibe-proof)
 
 ```
 plump/
-  env/         pure rules, no torch  → engine.py (PlumpEnv), cards.py
-  encode/      legacy 278/294 + tokenizer.py (future transformer)
-  models/      dqn.py (compat) + transformer.py (stub, FableDan-style)
-  config/      settings.py + settings.yaml (single source)
-  training/    buffers.py / rewards.py / runner.py
-  eval/        evaluate.py
-  play/        cli (rich)
-plump_env.py / train.py — thin shims re-exporting plump/* for compat
-tests/test_house.py — house rules
+  env/         pure rules → engine.py, cards.py
+  encode/      tokenizer.py (raw history) + legacy.py (278/294 compat)
+  models/      transformer.py (FableDan 4-block) + dqn.py
+  config/      settings.py/yaml single source
+  training/    train_dmc.py (DMC+league), buffers.py, runner.py
+plump_env.py / train.py / train_transformer.py — thin shims
+docs/          ARCHITECTURE/HOUSE_RULES/TRAINING
 ```
 
-**Rule:** Edit only `plump/` modules. Shims never contain logic.
-
-## Quick start (tomorrow 5h)
-
-```powershell
-python -u train.py          # house rules, resumes latest_v2.pt, ~630k in 5h
-# Ctrl+C saves interrupted_v2.pt
-python play.py              # human vs AI, uses new 5pt/leader
-```
-
-Legacy checkpoints (`best_v2.pt` 278/294) still load — warm-start.
-
-## Long-term (from research: DouZero DMC + FableDan Transformer + ScrofaZero MCTS)
-
-- **Current:** `Dueling DQN` DMC would be next — wait round end, `MSE(Q, return)`, no bootstrap.
-- **Next:** `plump/models/transformer.py` is stub `128d 4-block RoPE` ready to swap; `tokenizer.py` raw history `vocab 64`. Add `NTP + belief` aux heads (`FableDan` +0.02/0.05).
-- **Scale:** `plump/training/runner.py` is single-thread. For `M` hours continuous improvement add `train_fast.py` style `24 actors + batched GPU infer + league` (see `C:\Users\ozett\AppData\Local\Temp\opencode\FableDan`). No Rust needed until MCTS `10k sims` — then port `plump/env/engine.py` to Rust `pyo3` for `10-50x`.
-
-## Config
-
-Edit `plump/config/settings.yaml` or `settings.py:TRAIN/HOUSE`. No scattered magic numbers.
+**I chose restart Transformer for you:** old DQN stays in league so new brain learns to beat it, not from it. Run `train_transformer.py` tomorrow to begin long-term curve.
 
 ## Verify
 
 ```powershell
 python -c "from plump.config import terminal_reward; print(terminal_reward(0,0))" # 5.0
 python -c "from plump.env import PlumpEnv; e=PlumpEnv(); e.bids=[1,3,3,2]; print(e.get_leader())" # 1
+python -c "from plump.models.transformer import PlumpTransformer; print(\"transformer ok\")"
 ```
