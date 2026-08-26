@@ -1,0 +1,13 @@
+[package]
+name = "plump-engine"
+version = "0.2.0"
+edition = "2021"
+description = "Plump engine — pure Rust rules + deep search (MCTS determinization)"
+license = "MIT"
+
+[lib]
+name = "plump_engine"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rand = "0.8"

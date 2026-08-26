@@ -27,3 +27,8 @@ Thumbs.db
 # Temp
 *.log
 *.tmp
+
+# Rust
+/target
+Cargo.lock
+

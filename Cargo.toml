@@ -1,0 +1,8 @@
+[workspace]
+members = ["crates/plump-engine"]
+resolver = "2"
+
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
