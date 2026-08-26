@@ -1,4 +1,4 @@
-import os
+﻿import os
 import torch
 import numpy as np
 from rich.console import Console
@@ -20,7 +20,7 @@ from train import DuelingQNetwork
 
 console = Console()
 
-SUIT_SYMBOL = {"H": "♥", "D": "♦", "S": "♠", "C": "♣"}
+SUIT_SYMBOL = {"H": "â™¥", "D": "â™¦", "S": "â™ ", "C": "â™£"}
 SUIT_COLOR = {"H": "red bold", "D": "red bold", "S": "blue bold", "C": "blue bold"}
 PLAYER_NAMES = ["You", "AI 1", "AI 2", "AI 3"]
 PLAYER_COLORS = ["green", "cyan", "magenta", "yellow"]
@@ -68,7 +68,7 @@ def load_model(base_name, output_size, device):
             model = DuelingQNetwork(input_size, output_size)
             model.load_state_dict(state_dict)
             console.print(
-                f"  [green]✓[/] Loaded [dim]{path}[/]  (input_dim={input_size})"
+                f"  [green]+[/] Loaded [dim]{path}[/]  (input_dim={input_size})"
             )
             return model, input_size
 
@@ -103,7 +103,7 @@ def ai_action(model, encoder, env, player, phase):
 def play_against_ai():
     device = torch.device("cpu")
 
-    with console.status("[bold cyan]Loading AI models…[/]"):
+    with console.status("[bold cyan]Loading AI modelsâ€¦[/]"):
         bid_model, bid_input = load_model("plump_bid_model", 11, device)
         play_model, play_input = load_model("plump_play_model", 52, device)
 
@@ -121,8 +121,8 @@ def play_against_ai():
     console.print(
         Panel(
             Text.from_markup(
-                "🃏 [bold bright_white]P L U M P[/]\n"
-                "[dim]Human vs 3 AI Champions — Full Game[/]"
+                "ðŸƒ [bold bright_white]P L U M P[/]\n"
+                "[dim]Human vs 3 AI Champions â€” Full Game[/]"
             ),
             box=box.HEAVY,
             border_style="bright_blue",
@@ -135,29 +135,29 @@ def play_against_ai():
 
         console.print()
         console.rule(
-            f"[bold yellow]Round {round_idx + 1}[/] · {round_cards} card{'s' if round_cards != 1 else ''}",
+            f"[bold yellow]Round {round_idx + 1}[/] Â· {round_cards} card{'s' if round_cards != 1 else ''}",
             style="dim yellow",
         )
 
-        # ── Hand ────────────────────────────────────────────────────
+        # â”€â”€ Hand â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         hand_sorted = sorted(env.hands[0], key=lambda c: (c[0], c[1]))
         hand_str = "  ".join(card_rich(c) for c in hand_sorted)
         console.print(f"\n[b]Your Hand:[/]  {hand_str}")
 
-        # ── Bidding ─────────────────────────────────────────────────
-        console.print(f"\n[bold]📋 Bidding Phase[/]")
+        # â”€â”€ Bidding â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        console.print(f"\n[bold]ðŸ“‹ Bidding Phase[/]")
 
         for turn in range(4):
             if turn == 0:
                 while True:
                     bid = IntPrompt.ask(
-                        f"  [{PLAYER_COLORS[0]}]Your bid[/] [dim](0–{round_cards})[/]",
+                        f"  [{PLAYER_COLORS[0]}]Your bid[/] [dim](0â€“{round_cards})[/]",
                         console=console,
                     )
                     legal_mask = mask_actions(env, 0, "bid")
                     if 0 <= bid <= round_cards and legal_mask[bid]:
                         break
-                    console.print("  [red]✗ Illegal bid. Try again.[/]")
+                    console.print("  [red]x Illegal bid. Try again.[/]")
             else:
                 bid = ai_action(bid_model, bid_encoder, env, turn, "bid")
                 console.print(
@@ -174,14 +174,14 @@ def play_against_ai():
         bid_tbl.add_row(*[str(env.bids[p]) for p in range(4)])
         console.print(bid_tbl)
 
-        # ── Playing ─────────────────────────────────────────────────
+        # â”€â”€ Playing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # House rule: earliest highest bidder leads
         max_bid = max(env.bids)
         current_player = next(i for i, b in enumerate(env.bids) if b == max_bid)
         console.print(f"  [dim]Highest bid {max_bid} by {PLAYER_NAMES[current_player]} leads[/]")
 
         for trick in range(round_cards):
-            console.print(f"\n  [bold dim]── Trick {trick + 1}/{round_cards} ──[/]")
+            console.print(f"\n  [bold dim]â”€â”€ Trick {trick + 1}/{round_cards} â”€â”€[/]")
 
             for _ in range(4):
                 if current_player == 0:
@@ -204,9 +204,9 @@ def play_against_ai():
                     for idx, card in enumerate(my_hand):
                         is_legal = legal_mask[CARD_INDEX[card]]
                         if is_legal:
-                            ct.add_row(str(idx), card_rich(card), "[green]✔[/]")
+                            ct.add_row(str(idx), card_rich(card), "[green]+[/]")
                         else:
-                            ct.add_row(str(idx), f"[dim]{card_rich(card)}[/]", "[red]✗[/]")
+                            ct.add_row(str(idx), f"[dim]{card_rich(card)}[/]", "[red]x[/]")
 
                     console.print(ct)
 
@@ -218,14 +218,14 @@ def play_against_ai():
                             card = my_hand[choice]
                             if legal_mask[CARD_INDEX[card]]:
                                 break
-                        console.print("    [red]✗ Illegal choice — follow suit![/]")
+                        console.print("    [red]x Illegal choice â€” follow suit![/]")
 
-                    console.print(f"    [bold]→[/] You played {card_rich(card)}")
+                    console.print(f"    [bold]â†’[/] You played {card_rich(card)}")
                     env.play_card(0, card)
                 else:
                     card = ai_action(play_model, play_encoder, env, current_player, "play")
                     console.print(
-                        f"    [bold]→[/] [{PLAYER_COLORS[current_player]}]"
+                        f"    [bold]â†’[/] [{PLAYER_COLORS[current_player]}]"
                         f"{PLAYER_NAMES[current_player]}[/] plays {card_rich(card)}"
                     )
                     env.play_card(current_player, card)
@@ -234,12 +234,12 @@ def play_against_ai():
 
             winner, _ = env.resolve_trick()
             console.print(
-                f"    🏆 [{PLAYER_COLORS[winner]}]{PLAYER_NAMES[winner]}[/] "
+                f"    ðŸ† [{PLAYER_COLORS[winner]}]{PLAYER_NAMES[winner]}[/] "
                 f"takes the trick"
             )
             current_player = winner
 
-        # ── Round Scoring ───────────────────────────────────────────
+        # â”€â”€ Round Scoring â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         rt = Table(
             title=f"Round {round_idx + 1} Results",
             box=box.ROUNDED,
@@ -274,21 +274,21 @@ def play_against_ai():
         console.print()
         console.print(rt)
 
-    # ── Final Results ───────────────────────────────────────────────
+    # â”€â”€ Final Results â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     max_score = max(total_scores)
     rankings = sorted(range(4), key=lambda p: total_scores[p], reverse=True)
 
     ft = Table(
         box=box.HEAVY,
         show_lines=True,
-        title="🏆  Final Standings  🏆",
+        title="ðŸ†  Final Standings  ðŸ†",
         title_style="bold yellow",
     )
     ft.add_column("Rank", justify="center", style="bold")
     ft.add_column("Player", style="bold")
     ft.add_column("Score", justify="center", style="bold")
 
-    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    medals = {1: "ðŸ¥‡", 2: "ðŸ¥ˆ", 3: "ðŸ¥‰"}
     for rank, p in enumerate(rankings, 1):
         is_champ = total_scores[p] == max_score
         medal = medals.get(rank, "  ")
@@ -305,9 +305,9 @@ def play_against_ai():
 
     winner_idx = total_scores.index(max_score)
     if winner_idx == 0:
-        console.print("\n[bold green]🎉 You won the game![/]\n")
+        console.print("\n[bold green]ðŸŽ‰ You won the game![/]\n")
     else:
-        console.print(f"\n[bold red]💀 {PLAYER_NAMES[winner_idx]} wins the game![/]\n")
+        console.print(f"\n[bold red]ðŸ’€ {PLAYER_NAMES[winner_idx]} wins the game![/]\n")
 
 
 if __name__ == "__main__":
