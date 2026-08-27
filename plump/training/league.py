@@ -65,6 +65,66 @@ class DQNOpponent:
         return INDEX_TO_CARD[int(q.argmax().item())]
 
 
+class TransformerOpponent:
+    """Wrapper for frozen Transformer champion (single model, two heads)."""
+
+    def __init__(self, path: str, device="cpu"):
+        self.device = torch.device(device)
+        from ..models.transformer import PlumpTransformer, PlumpTransformerConfig
+        import torch as _t
+
+        sd = _t.load(path, map_location=self.device)
+        # infer d_model
+        d_model = sd["token_emb.weight"].shape[1] if "token_emb.weight" in sd else 64
+        n_blocks = len([k for k in sd.keys() if k.startswith("blocks.") and k.endswith(".attn.q_proj.weight")])
+        n_blocks = max(2, n_blocks)
+        cfg = PlumpTransformerConfig(d_model=d_model, n_blocks=n_blocks, n_heads=4, ffn_hidden=256 if d_model==64 else 512, hand_hidden=128 if d_model==64 else 512, q_hidden=256 if d_model==64 else 1024)
+        self.model = PlumpTransformer(cfg).to(self.device)
+        self.model.load_state_dict(sd)
+        self.model.eval()
+
+    def act_bid(self, env, player):
+        from ..encode.tokenizer import encode_decision
+        import torch as _t
+        import numpy as np
+
+        toks, feats = encode_decision(env, player)
+        t_toks = _t.tensor(np.array([toks]), dtype=_t.long, device=self.device)
+        t_feats = _t.tensor(np.array([feats]), dtype=_t.float32, device=self.device)
+        with _t.no_grad():
+            q = self.model(t_toks, t_feats, phase="bid")[0]
+        legal = mask_actions(env, player, "bid")
+        best = -1e9
+        best_idx = -1
+        q_np = q.cpu().numpy()
+        for i, ok in enumerate(legal):
+            if ok and q_np[i] > best:
+                best = q_np[i]
+                best_idx = i
+        return best_idx
+
+    def act_play(self, env, player):
+        from ..encode.tokenizer import encode_decision
+        from ..env.cards import CARD_INDEX, INDEX_TO_CARD
+        import torch as _t
+        import numpy as np
+
+        toks, feats = encode_decision(env, player)
+        t_toks = _t.tensor(np.array([toks]), dtype=_t.long, device=self.device)
+        t_feats = _t.tensor(np.array([feats]), dtype=_t.float32, device=self.device)
+        with _t.no_grad():
+            q = self.model(t_toks, t_feats, phase="play")[0]
+        legal = mask_actions(env, player, "play")
+        best = -1e9
+        best_idx = -1
+        q_np = q.cpu().numpy()
+        for i, ok in enumerate(legal):
+            if ok and q_np[i] > best:
+                best = q_np[i]
+                best_idx = i
+        return INDEX_TO_CARD[best_idx]
+
+
 class RandomOpponent:
     def act_bid(self, env, player):
         legal = mask_actions(env, player, "bid")
@@ -77,9 +137,11 @@ class RandomOpponent:
 
 
 class League:
-    """Simple pool: sample opponent type per seat per game."""
+    """Simple pool: sample opponent type per seat per game.
+    New champion is Transformer; old DQN kept low weight for diversity.
+    """
 
-    def __init__(self, dqn_paths: list[tuple[str, str]] | None = None):
+    def __init__(self, dqn_paths: list[tuple[str, str]] | None = None, transformer_paths: list[str] | None = None):
         self.members: list[tuple[str, object]] = []
         # always have random
         self.members.append(("random", RandomOpponent()))
@@ -90,6 +152,13 @@ class League:
                     self.members.append((f"dqn:{bid_p}", opp))
                 except Exception as e:
                     print(f"[league] skip {bid_p}: {e}")
+        if transformer_paths:
+            for p in transformer_paths:
+                try:
+                    opp = TransformerOpponent(p)
+                    self.members.append((f"trans:{p}", opp))
+                except Exception as e:
+                    print(f"[league] skip {p}: {e}")
 
     def sample(self) -> tuple[str, object]:
         # weight random 30%, rest uniform

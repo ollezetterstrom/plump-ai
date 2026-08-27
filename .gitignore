@@ -24,9 +24,14 @@ runs/
 .DS_Store
 Thumbs.db
 
-# Temp
+# Temp / training state
 *.log
 *.tmp
+plump_transformer_*.txt
+train_log_*.txt*
+REPLAY.md
+RECAP.md
+TOMORROW.md
 
 # Rust
 /target

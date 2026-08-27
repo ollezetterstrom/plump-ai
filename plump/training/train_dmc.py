@@ -204,13 +204,20 @@ def train_restart():
     # Save buffers at most every 10k episodes (writes ~100MB; more often would stall the GPU)
     buf_last_save = [start_ep]
 
-    # League includes old DQN champions if present
+    # League includes old DQN + new Transformer champion (promoted 759k)
     dqn_paths = []
     if os.path.exists("plump_bid_model_champion.pt"):
         dqn_paths.append(("plump_bid_model_champion.pt", "plump_play_model_champion.pt"))
     if os.path.exists("plump_bid_model_best_v2.pt"):
         dqn_paths.append(("plump_bid_model_best_v2.pt", "plump_play_model_best_v2.pt"))
-    league = League(dqn_paths if dqn_paths else None)
+    trans_paths = []
+    if os.path.exists("plump_transformer_champion.pt"):
+        trans_paths.append("plump_transformer_champion.pt")
+    if os.path.exists("plump_transformer_best.pt"):
+        # keep best as well for diversity, but champion is enough
+        if "plump_transformer_best.pt" not in trans_paths:
+            trans_paths.append("plump_transformer_best.pt")
+    league = League(dqn_paths if dqn_paths else None, trans_paths if trans_paths else None)
     print(f"[league] {len(league.members)} members: {[n for n,_ in league.members]}")
 
     env = PlumpEnv()
