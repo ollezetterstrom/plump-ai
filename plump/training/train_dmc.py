@@ -180,16 +180,16 @@ def train_restart():
 
     def _save_buffers():
         if bid_buffer:
-            np.savez_compressed(buf_path_b,
-                toks=np.array([b[0] for b in bid_buffer], dtype=np.int64),
+            np.savez(buf_path_b,
+                toks=np.stack([b[0] for b in bid_buffer]).astype(np.int16),
                 feats=np.stack([b[1] for b in bid_buffer]),
-                act=np.array([b[2] for b in bid_buffer], dtype=np.int64),
+                act=np.array([b[2] for b in bid_buffer], dtype=np.int16),
                 ret=np.array([b[3] for b in bid_buffer], dtype=np.float32))
         if play_buffer:
-            np.savez_compressed(buf_path_p,
-                toks=np.array([p[0] for p in play_buffer], dtype=np.int64),
+            np.savez(buf_path_p,
+                toks=np.stack([p[0] for p in play_buffer]).astype(np.int16),
                 feats=np.stack([p[1] for p in play_buffer]),
-                act=np.array([p[2] for p in play_buffer], dtype=np.int64),
+                act=np.array([p[2] for p in play_buffer], dtype=np.int16),
                 ret=np.array([p[3] for p in play_buffer], dtype=np.float32))
 
     def _load_buffers():
@@ -197,10 +197,12 @@ def train_restart():
             if path.exists():
                 z = np.load(path)
                 for i in range(len(z["act"])):
-                    buf.append((list(z["toks"][i]), z["feats"][i], int(z["act"][i]), float(z["ret"][i])))
+                    buf.append((z["toks"][i].astype(np.int64), z["feats"][i], int(z["act"][i]), float(z["ret"][i])))
                 print(f"[resume] {mk} buffer restored: {len(buf)} samples")
 
     _load_buffers()
+    # Save buffers at most every 10k episodes (writes ~100MB; more often would stall the GPU)
+    buf_last_save = [start_ep]
 
     # League includes old DQN champions if present
     dqn_paths = []
@@ -241,7 +243,7 @@ def train_restart():
             # ── LEARN every 16 games ────────────────────────────────────────
             if ep % 16 == 0 and len(play_buffer) >= batch:
                 batch_items = random.sample(play_buffer, batch)
-                toks_batch = torch.tensor([x[0] for x in batch_items], dtype=torch.long, device=device)
+                toks_batch = torch.from_numpy(np.array([x[0] for x in batch_items], dtype=np.int64)).to(device)
                 feats_batch = torch.tensor(np.stack([x[1] for x in batch_items]), dtype=torch.float32, device=device)
                 actions = torch.tensor([x[2] for x in batch_items], dtype=torch.long, device=device)
                 returns = torch.tensor([x[3] for x in batch_items], dtype=torch.float32, device=device)
@@ -256,7 +258,7 @@ def train_restart():
 
             if ep % 16 == 0 and len(bid_buffer) >= batch:
                 batch_items = random.sample(bid_buffer, batch)
-                toks_batch = torch.tensor([x[0] for x in batch_items], dtype=torch.long, device=device)
+                toks_batch = torch.from_numpy(np.array([x[0] for x in batch_items], dtype=np.int64)).to(device)
                 feats_batch = torch.tensor(np.stack([x[1] for x in batch_items]), dtype=torch.float32, device=device)
                 actions = torch.tensor([x[2] for x in batch_items], dtype=torch.long, device=device)
                 returns = torch.tensor([x[3] for x in batch_items], dtype=torch.float32, device=device)
@@ -269,26 +271,28 @@ def train_restart():
                 nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
 
-        if ep % 1000 == 0:
-            # eval vs league random sample
-            wins = 0
-            total = 0
-            for _ in range(200):
-                _, _, _, _, env_e = play_one_game_transformer(PlumpEnv(), model, league, device, epsilon=0.0)
-                total += terminal_reward(env_e.tricks_won[0], env_e.bids[0])
-                if env_e.tricks_won[0] == env_e.bids[0]:
-                    wins += 1
-            winrate = wins / 200 * 100
-            avg = total / 200
-            print(f"Ep {ep:6d} | win {winrate:5.1f}% avg {avg:+5.2f} | buf {len(play_buffer)}/{len(bid_buffer)}")
-            if avg > best:
-                best = avg
-                Path("plump_transformer_best_score.txt").write_text(f"{best:.4f}")
-                torch.save(model.state_dict(), "plump_transformer_best.pt")
-                print(f"  -> new best {best:.2f} saved")
-            torch.save(model.state_dict(), "plump_transformer_latest.pt")
-            Path("plump_transformer_session.txt").write_text(str(ep))
-            _save_buffers()
+            # ── EVAL + CHECKPOINT every 1000 games ──────────────────────────
+            if ep % 1000 == 0:
+                wins = 0
+                total = 0
+                for _ in range(200):
+                    _, _, _, _, env_e = play_one_game_transformer(PlumpEnv(), model, league, device, epsilon=0.0)
+                    total += terminal_reward(env_e.tricks_won[0], env_e.bids[0])
+                    if env_e.tricks_won[0] == env_e.bids[0]:
+                        wins += 1
+                winrate = wins / 200 * 100
+                avg = total / 200
+                print(f"Ep {ep:6d} | win {winrate:5.1f}% avg {avg:+5.2f} | buf {len(play_buffer)}/{len(bid_buffer)}")
+                if avg > best:
+                    best = avg
+                    Path("plump_transformer_best_score.txt").write_text(f"{best:.4f}")
+                    torch.save(model.state_dict(), "plump_transformer_best.pt")
+                    print(f"  -> new best {best:.2f} saved")
+                torch.save(model.state_dict(), "plump_transformer_latest.pt")
+                Path("plump_transformer_session.txt").write_text(str(ep))
+                if ep - buf_last_save[0] >= 10_000:
+                    _save_buffers()
+                    buf_last_save[0] = ep
 
     except KeyboardInterrupt:
         print(f"\n[!] interrupted at ep {ep:,} — saving full state (weights + buffers + counter)...")
