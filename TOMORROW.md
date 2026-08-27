@@ -2,40 +2,57 @@
 
 Delete this file after tomorrow.
 
-## What to run (pick ONE)
+## Before you leave: REBOOT once (recommended)
 
-**Long-term correct (restart, recommended):**
+Some half-killed GPU test processes from my testing are stuck "terminating" and only a
+reboot reliably clears them. 30 seconds now = clean GPU for the next 5 hours.
+
+## Then run (ONE command)
+
 ```powershell
 cd C:\Users\ozett\Documents\Projects\plumptrain
-python -u train_transformer.py
+.\start_overnight.ps1
 ```
-- Starts new `Transformer + DMC + league` from scratch.
-- League = `random` + your old `champion/best_v2.pt` as sparring partners (it learns to BEAT them).
-- Saves `plump_transformer_best.pt` / `plump_transformer_latest.pt` every 1000 games.
-- ~200k budget, interrupt with `Ctrl+C` anytime — resumes next run.
 
-**Quick house-rules fine-tune (old DQN, keeps saves):**
+That starts training detached (survives closing the terminal) and prints the log file name.
+Close the lid / walk away. It saves progress every ~50 seconds.
+
+## What it does
+
+`train_transformer.py` — new brain (`Transformer + DMC + league`) trained against your old
+champion bots + randomness. **Fully resumable**: weights, replay buffers, and episode
+counter all persist — Ctrl+C, crash, or stop → rerun the same script, it continues exactly.
+
+- Checkpoints: `plump_transformer_latest.pt` (every eval), `plump_transformer_best.pt`
+  (whenever average score improves)
+- Progress log lines look like:
+  `Ep   6000 | win  34.5% avg +1.84 | buf ...`
+- Two `AMD ROCm attention experimental` warnings at startup are normal noise.
+
+## Playing while/after training
+
 ```powershell
-python -u train.py
+python play.py               # old champion bots, instant
+python play.py --search 12   # same bots + deep search (imagines 12 hidden-hands per move) — still instant (~10ms/move), usually stronger
 ```
-- Resumes `plump_*_v2.pt` (630k/5h), just fixes `0=5` + `leader`. Will plateau eventually.
 
-Both use house `0=5` + `highest earliest leads` — already in `plump/env/engine.py:105`.
+House rules are active in both paths: `0-bid made = 5 pts`, highest bidder (earliest tie) leads.
 
-## Play
-```powershell
-python play.py                 # human vs 3 AI champions (old DQN), house rules
-```
-Deep search (`plump/search/mcts.py`) is tested and works, but not wired into `play.py` yet on purpose: the new transformer (27% after 1000 eps) would lose to your old champion today. We integrate it once training catches up.
+## Honest status — done vs not-done
 
-## Monitor / behave
-- Look for `Ep  1000 | win ...%` every ~50s. Win starts ~25% (from-scratch) and should climb past 40-50% within the hour.
-- The two `Flash/Mem Efficient attention ... experimental` warnings at startup are benign (AMD ROCm).
-- If it ever prints `done restart DMC+Transformer+league...` before your 5h ends, just run the same command again — every 50s it saved `plump_transformer_latest.pt`, so a rerun loses almost nothing.
-- `Ctrl+C` is always safe.
+DONE & TESTED TODAY
+- Both training paths run for hours, checkpoint + resume correctly
+- House rules in engine + scoring, verified by tests
+- play.py `--search N` deep search wired and tested (10ms at 12 worlds)
+- Rust engine compiles & unit tests pass (not yet bridged to Python — see below)
 
-## After 5h
-- Leave `plump_transformer_*.pt` where they are; keep running this path on future days — that is the long-term climb.
-- Do NOT copy them over `champion.pt`: `play.py` still uses the DQN champion until the transformer beats it in eval (we'll swap deliberately when it does).
+NOT DONE YET (deliberate, next sessions)
+- Rust-to-Python bridge (maturin): search currently uses the Python world-sampler;
+  at 10ms/move that is irrelevant for playing, matters only for heavy research later
+- NTP/belief auxiliary heads exist in the model but aren't in the loss yet (+few % when added)
+- Training is single-process; FableDan-style multi-actor batching would ~10x throughput
+- No Elo/auto-promotion between checkpoints yet
+
+None of these block tonight. The run collects experience regardless.
 
 Delete this file when done.

@@ -1,4 +1,5 @@
 ﻿import os
+import argparse
 import torch
 import numpy as np
 from rich.console import Console
@@ -20,7 +21,7 @@ from train import DuelingQNetwork
 
 console = Console()
 
-SUIT_SYMBOL = {"H": "â™¥", "D": "â™¦", "S": "â™ ", "C": "â™£"}
+SUIT_SYMBOL = {"H": "H", "D": "D", "S": "S", "C": "C"}
 SUIT_COLOR = {"H": "red bold", "D": "red bold", "S": "blue bold", "C": "blue bold"}
 PLAYER_NAMES = ["You", "AI 1", "AI 2", "AI 3"]
 PLAYER_COLORS = ["green", "cyan", "magenta", "yellow"]
@@ -100,10 +101,47 @@ def ai_action(model, encoder, env, player, phase):
     return INDEX_TO_CARD[action]
 
 
+def ai_action_search(play_model, encoder, env, player, n_worlds):
+    """Determinized deep search: sample N worlds consistent with voids+played,
+    score each of our legal cards with the champion brain in every world,
+    play the best average. (Rust engine can replace the sampler later.)"""
+    from plump.search.mcts import sample_worlds_py
+
+    legal_cards = env.legal_cards(player)
+    if len(legal_cards) == 1:
+        return legal_cards[0]
+
+    worlds = sample_worlds_py(env, player, n_worlds)
+    if not worlds:
+        return ai_action(play_model, encoder, env, player, "play")
+
+    scores: dict = {c: [] for c in legal_cards}
+    for w in worlds:
+        st = torch.from_numpy(np.array(encoder(w, player), dtype=np.float32))
+        with torch.no_grad():
+            q = play_model(st)
+        wmask = mask_actions(w, player, "play")
+        for c in legal_cards:
+            idx = CARD_INDEX[c]
+            # viewer's hand is identical in every world, so our cards stay legal;
+            # guard anyway in case future samplers disagree
+            if wmask[idx]:
+                scores[c].append(float(q[idx]))
+
+    avg = {c: (sum(v) / len(v) if v else -1e9) for c, v in scores.items()}
+    return max(avg, key=avg.get)
+
+
 def play_against_ai():
+    parser = argparse.ArgumentParser(description="Plump — you vs 3 AI champions")
+    parser.add_argument("--search", type=int, default=0,
+                        help="deep search worlds for AI card plays (e.g. 12). 0 = instant greedy")
+    args = parser.parse_args()
+    n_search = max(0, args.search)
+
     device = torch.device("cpu")
 
-    with console.status("[bold cyan]Loading AI modelsâ€¦[/]"):
+    with console.status("[bold cyan]Loading AI models…[/]"):
         bid_model, bid_input = load_model("plump_bid_model", 11, device)
         play_model, play_input = load_model("plump_play_model", 52, device)
 
@@ -112,6 +150,9 @@ def play_against_ai():
 
     bid_model.eval()
     play_model.eval()
+
+    if n_search:
+        console.print(f"  [bold cyan]Deep search ON: {n_search} worlds per AI move[/]")
 
     env = PlumpEnv()
     total_scores = [0] * 4
@@ -223,9 +264,12 @@ def play_against_ai():
                     console.print(f"    [bold]â†’[/] You played {card_rich(card)}")
                     env.play_card(0, card)
                 else:
-                    card = ai_action(play_model, play_encoder, env, current_player, "play")
+                    if n_search:
+                        card = ai_action_search(play_model, play_encoder, env, current_player, n_search)
+                    else:
+                        card = ai_action(play_model, play_encoder, env, current_player, "play")
                     console.print(
-                        f"    [bold]â†’[/] [{PLAYER_COLORS[current_player]}]"
+                        f"    [bold]→[/] [{PLAYER_COLORS[current_player]}]"
                         f"{PLAYER_NAMES[current_player]}[/] plays {card_rich(card)}"
                     )
                     env.play_card(current_player, card)

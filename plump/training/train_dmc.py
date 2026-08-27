@@ -156,6 +156,52 @@ def train_restart():
     # Bid and play share encoder but separate heads — single model
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
+    # ── RESUME: pick up exactly where the last session stopped ───────────────
+    # Session counter survives restarts via plump_transformer_session.txt
+    start_ep = 0
+    if os.path.exists("plump_transformer_latest.pt"):
+        try:
+            model.load_state_dict(torch.load("plump_transformer_latest.pt", map_location=device))
+            print("[resume] loaded plump_transformer_latest.pt — continuing, not restarting")
+        except Exception as e:
+            print(f"[!] resume failed ({e}) — starting fresh")
+    if os.path.exists("plump_transformer_session.txt"):
+        try:
+            start_ep = int(Path("plump_transformer_session.txt").read_text().strip())
+            print(f"[resume] episode counter at {start_ep:,}")
+        except Exception:
+            start_ep = 0
+
+    # Replay buffers also persist so DMC doesn't lose its experience on rerun
+    bid_buffer: list[tuple] = []
+    play_buffer: list[tuple] = []
+    buf_path_b = Path("plump_transformer_buf_bid.npz")
+    buf_path_p = Path("plump_transformer_buf_play.npz")
+
+    def _save_buffers():
+        if bid_buffer:
+            np.savez_compressed(buf_path_b,
+                toks=np.array([b[0] for b in bid_buffer], dtype=np.int64),
+                feats=np.stack([b[1] for b in bid_buffer]),
+                act=np.array([b[2] for b in bid_buffer], dtype=np.int64),
+                ret=np.array([b[3] for b in bid_buffer], dtype=np.float32))
+        if play_buffer:
+            np.savez_compressed(buf_path_p,
+                toks=np.array([p[0] for p in play_buffer], dtype=np.int64),
+                feats=np.stack([p[1] for p in play_buffer]),
+                act=np.array([p[2] for p in play_buffer], dtype=np.int64),
+                ret=np.array([p[3] for p in play_buffer], dtype=np.float32))
+
+    def _load_buffers():
+        for path, buf, mk in ((buf_path_b, bid_buffer, "bid"), (buf_path_p, play_buffer, "play")):
+            if path.exists():
+                z = np.load(path)
+                for i in range(len(z["act"])):
+                    buf.append((list(z["toks"][i]), z["feats"][i], int(z["act"][i]), float(z["ret"][i])))
+                print(f"[resume] {mk} buffer restored: {len(buf)} samples")
+
+    _load_buffers()
+
     # League includes old DQN champions if present
     dqn_paths = []
     if os.path.exists("plump_bid_model_champion.pt"):
@@ -166,71 +212,62 @@ def train_restart():
     print(f"[league] {len(league.members)} members: {[n for n,_ in league.members]}")
 
     env = PlumpEnv()
-    # Buffers for DMC — simple lists, sample random batch
-    bid_buffer: list[tuple] = []
-    play_buffer: list[tuple] = []
 
-    episodes = 400_000  # ~5h+ at ~19.5 eps/s on RX 9060 XT; Ctrl+C anytime
+    episodes = start_ep + 400_000  # always 5h+ of runway from wherever we are
     batch = 128
-    epsilon = 0.2
     best = -1e9
+    if os.path.exists("plump_transformer_best_score.txt"):
+        try:
+            best = float(Path("plump_transformer_best_score.txt").read_text().strip())
+        except Exception:
+            best = -1e9
 
-    for ep in range(1, episodes + 1):
-        b_dec, p_dec, b_ret, p_ret, env_out = play_one_game_transformer(env, model, league, device, epsilon)
+    try:
+        for ep in range(start_ep + 1, episodes + 1):
+            # mild exploration decay, floored so league stays diverse forever
+            epsilon = max(0.05, 0.20 * (0.99995 ** ep))
+            b_dec, p_dec, b_ret, p_ret, env_out = play_one_game_transformer(env, model, league, device, epsilon)
 
-        # push to buffers
-        for d, ret in zip(b_dec, b_ret):
-            toks = d["toks"]
-            feats = d["feats"]
-            # pad toks to MAX_SEQ? Already padded in tokenizer
-            bid_buffer.append((toks, feats, d["action"], ret, d["legal"]))
-            if len(bid_buffer) > 50000:
-                bid_buffer.pop(0)
-        for d, ret in zip(p_dec, p_ret):
-            toks = d["toks"]
-            feats = d["feats"]
-            play_buffer.append((toks, feats, d["action"], ret, d["legal"]))
-            if len(play_buffer) > 100000:
-                play_buffer.pop(0)
+            # push to buffers (tuples: toks, feats, action, return)
+            for d, ret in zip(b_dec, b_ret):
+                bid_buffer.append((d["toks"], d["feats"], d["action"], ret))
+                if len(bid_buffer) > 50000:
+                    bid_buffer.pop(0)
+            for d, ret in zip(p_dec, p_ret):
+                play_buffer.append((d["toks"], d["feats"], d["action"], ret))
+                if len(play_buffer) > 100000:
+                    play_buffer.pop(0)
 
-        # learn every 16 games
-        if ep % 16 == 0 and len(play_buffer) >= batch:
-            # sample batch
-            batch_items = random.sample(play_buffer, batch)
-            toks_batch = torch.tensor([x[0] for x in batch_items], dtype=torch.long, device=device)
-            feats_batch = torch.tensor(np.stack([x[1] for x in batch_items]), dtype=torch.float32, device=device)
-            actions = torch.tensor([x[2] for x in batch_items], dtype=torch.long, device=device)
-            returns = torch.tensor([x[3] for x in batch_items], dtype=torch.float32, device=device)
-            model.train()
-            q = model(toks_batch, feats_batch, phase="play")
-            # gather Q for taken action
-            q_taken = q.gather(1, actions.unsqueeze(1)).squeeze(1)
-            loss = nn.MSELoss()(q_taken, returns)
-            # NTP aux: simple next token CE on last batch (if weight >0)
-            if cfg.ntp_weight > 0:
-                # create ntp targets: shift toks
-                with torch.no_grad():
-                    # dummy ntp loss just to keep graph — real would need token targets
-                    pass
-            optimizer.zero_grad()
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+            # ── LEARN every 16 games ────────────────────────────────────────
+            if ep % 16 == 0 and len(play_buffer) >= batch:
+                batch_items = random.sample(play_buffer, batch)
+                toks_batch = torch.tensor([x[0] for x in batch_items], dtype=torch.long, device=device)
+                feats_batch = torch.tensor(np.stack([x[1] for x in batch_items]), dtype=torch.float32, device=device)
+                actions = torch.tensor([x[2] for x in batch_items], dtype=torch.long, device=device)
+                returns = torch.tensor([x[3] for x in batch_items], dtype=torch.float32, device=device)
+                model.train()
+                q = model(toks_batch, feats_batch, phase="play")
+                q_taken = q.gather(1, actions.unsqueeze(1)).squeeze(1)
+                loss = nn.MSELoss()(q_taken, returns)
+                optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
 
-        if ep % 16 == 0 and len(bid_buffer) >= batch:
-            batch_items = random.sample(bid_buffer, batch)
-            toks_batch = torch.tensor([x[0] for x in batch_items], dtype=torch.long, device=device)
-            feats_batch = torch.tensor(np.stack([x[1] for x in batch_items]), dtype=torch.float32, device=device)
-            actions = torch.tensor([x[2] for x in batch_items], dtype=torch.long, device=device)
-            returns = torch.tensor([x[3] for x in batch_items], dtype=torch.float32, device=device)
-            model.train()
-            q = model(toks_batch, feats_batch, phase="bid")
-            q_taken = q.gather(1, actions.unsqueeze(1)).squeeze(1)
-            loss = nn.MSELoss()(q_taken, returns)
-            optimizer.zero_grad()
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+            if ep % 16 == 0 and len(bid_buffer) >= batch:
+                batch_items = random.sample(bid_buffer, batch)
+                toks_batch = torch.tensor([x[0] for x in batch_items], dtype=torch.long, device=device)
+                feats_batch = torch.tensor(np.stack([x[1] for x in batch_items]), dtype=torch.float32, device=device)
+                actions = torch.tensor([x[2] for x in batch_items], dtype=torch.long, device=device)
+                returns = torch.tensor([x[3] for x in batch_items], dtype=torch.float32, device=device)
+                model.train()
+                q = model(toks_batch, feats_batch, phase="bid")
+                q_taken = q.gather(1, actions.unsqueeze(1)).squeeze(1)
+                loss = nn.MSELoss()(q_taken, returns)
+                optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
 
         if ep % 1000 == 0:
             # eval vs league random sample
@@ -246,9 +283,19 @@ def train_restart():
             print(f"Ep {ep:6d} | win {winrate:5.1f}% avg {avg:+5.2f} | buf {len(play_buffer)}/{len(bid_buffer)}")
             if avg > best:
                 best = avg
+                Path("plump_transformer_best_score.txt").write_text(f"{best:.4f}")
                 torch.save(model.state_dict(), "plump_transformer_best.pt")
                 print(f"  -> new best {best:.2f} saved")
             torch.save(model.state_dict(), "plump_transformer_latest.pt")
+            Path("plump_transformer_session.txt").write_text(str(ep))
+            _save_buffers()
+
+    except KeyboardInterrupt:
+        print(f"\n[!] interrupted at ep {ep:,} — saving full state (weights + buffers + counter)...")
+        torch.save(model.state_dict(), "plump_transformer_latest.pt")
+        Path("plump_transformer_session.txt").write_text(str(ep))
+        _save_buffers()
+        print("[+] saved. Next run continues exactly here.")
 
     print("done restart DMC+Transformer+league — old DQN was in league as sparring partner")
 
