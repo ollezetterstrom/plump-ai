@@ -215,7 +215,7 @@ def train_restart():
 
     env = PlumpEnv()
 
-    episodes = start_ep + 400_000  # always 5h+ of runway from wherever we are
+    episodes = start_ep + 800_000  # runway covers 6.5h+ sessions (~25-30 games/s); Ctrl+C anytime
     batch = 128
     best = -1e9
     if os.path.exists("plump_transformer_best_score.txt"):
