@@ -22,21 +22,20 @@ python -u train.py
 
 Both use house `0=5` + `highest earliest leads` — already in `plump/env/engine.py:105`.
 
-## Play — now with deep search (Rust optional)
+## Play
 ```powershell
-python play.py                 # instant greedy
-python play.py --search 16     # expert: 16 worlds, ~0.3s/move, Rust 10x if cargo build --release
-python play.py --search 32     # stronger, ~0.6s
+python play.py                 # human vs 3 AI champions (old DQN), house rules
 ```
-Search wrapper `plump/search/mcts.py:1` averages `Transformer` Q over worlds. Rust `crates/plump-engine/src/search.rs:1` is fallback to Python if not built.
+Deep search (`plump/search/mcts.py`) is tested and works, but not wired into `play.py` yet on purpose: the new transformer (27% after 1000 eps) would lose to your old champion today. We integrate it once training catches up.
 
-`cargo check` already passes — run `cargo build --release` to enable Rust speed.
-
-## Monitor
-Look for `Ep 1000 | win 58%` lines. `Ctrl+C` saves `interrupted_v2.pt` / `plump_transformer_latest.pt`.
+## Monitor / behave
+- Look for `Ep  1000 | win ...%` every ~50s. Win starts ~25% (from-scratch) and should climb past 40-50% within the hour.
+- The two `Flash/Mem Efficient attention ... experimental` warnings at startup are benign (AMD ROCm).
+- If it ever prints `done restart DMC+Transformer+league...` before your 5h ends, just run the same command again — every 50s it saved `plump_transformer_latest.pt`, so a rerun loses almost nothing.
+- `Ctrl+C` is always safe.
 
 ## After 5h
-- `train_transformer.py` → keep running days/weeks, it keeps improving.
-- `train.py` → copy `best_v2.pt` → `champion.pt` to make play.py use it.
+- Leave `plump_transformer_*.pt` where they are; keep running this path on future days — that is the long-term climb.
+- Do NOT copy them over `champion.pt`: `play.py` still uses the DQN champion until the transformer beats it in eval (we'll swap deliberately when it does).
 
 Delete this file when done.

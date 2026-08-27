@@ -170,7 +170,7 @@ def train_restart():
     bid_buffer: list[tuple] = []
     play_buffer: list[tuple] = []
 
-    episodes = 200_000  # restart budget, interrupt anytime
+    episodes = 400_000  # ~5h+ at ~19.5 eps/s on RX 9060 XT; Ctrl+C anytime
     batch = 128
     epsilon = 0.2
     best = -1e9
