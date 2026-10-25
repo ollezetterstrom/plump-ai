@@ -1,39 +1,15 @@
-﻿# Python
+target/
+.env
+.venv/
 __pycache__/
 *.py[cod]
-*$py.class
-*.so
-*.egg-info/
 .pytest_cache/
-.venv/
-venv/
-build/
-dist/
-
-# Plump models - too large for git, use releases
-*.pt
-*.pth
-*.ckpt
-*.npz
-checkpoints/
-ckpts/
-wandb/
-runs/
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Temp / training state
-*.log
-*.tmp
-plump_transformer_*.txt
-train_log_*.txt*
-REPLAY.md
-RECAP.md
-TOMORROW.md
-
-# Rust
-/target
-Cargo.lock
-
+*.egg-info/
+*.pyd
+*.so
+*.dylib
+plump_engine*.pyd
+plump_transformer_latest.pt
+plump_transformer_best.pt
+plump_transformer_session.txt
+logs/

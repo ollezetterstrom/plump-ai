@@ -1,0 +1,27 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "plump"
+version = "0.1.0"
+description = "Hybrid Rust + PyTorch AI for Swedish Plump"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "torch>=2.0",
+    "rich>=13.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "maturin>=1.5"]
+
+[tool.maturin]
+manifest-path = "crates/plump-engine/Cargo.toml"
+features = ["python"]
+module-name = "plump_engine"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-q"

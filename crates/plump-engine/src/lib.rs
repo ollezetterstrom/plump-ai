@@ -1,10 +1,16 @@
-//! plump-engine — Rust rules + search, mirrors plump/env/engine.py
-//! House v2: 0=5, earliest highest leads.
-//! Decoupled: no Python, no torch. Used by plump/search/mcts.py for 10-50x rollout.
+//! Plump engine: a compact `u64` bitboard implementation of the Swedish
+//! card game Plump, plus PIMC/endgame search, suit-isomorphism augmentation
+//! and a parallel vectorised environment for reinforcement learning.
 
-pub mod cards;
+pub mod augment;
 pub mod engine;
 pub mod search;
+pub mod vec_env;
 
-pub use cards::{card_index, index_to_card, SUITS};
-pub use engine::PlumpEnv;
+#[cfg(feature = "python")]
+pub mod python;
+
+pub use engine::{
+    card_index, display_points, rank_of, suit_of, terminal_reward, FastEnv, Phase, BID_BASE,
+    CARD_BASE, FEAT_DIM, MAX_SEQ, PAD_TOK, PLAYER_BASE, ROUND_SCHEDULE, VOCAB,
+};

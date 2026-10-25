@@ -1,13 +1,22 @@
-# Launch overnight training detached from any terminal.
-# Usage: .\start_overnight.ps1     (log: train_log.txt)
-$dir = Split-Path -Parent $MyInvocation.MyCommand.Path
-Set-Location $dir
-$stamp = Get-Date -Format "yyyyMMdd_HHmm"
-$log = "train_log_$stamp.txt"
-Start-Process -FilePath "python" -ArgumentList "-u", "train_transformer.py" `
-    -WorkingDirectory $dir -RedirectStandardOutput $log -RedirectStandardError "$log.err" `
-    -WindowStyle Hidden
-Write-Host "Started. Log: $log"
-Write-Host "Watch progress:   Get-Content $log -Wait"
-Write-Host "Check checkpoints: Get-ChildItem plump_transformer*.pt"
-Write-Host "Stop:              Stop-Process -Name python"
+param(
+    [int]$Rounds = 800000,
+    [string]$Device = "auto",
+    [string]$Resume = ""
+)
+
+$ErrorActionPreference = "Stop"
+$root = Split-Path -Parent $MyInvocation.MyCommand.Path
+Set-Location $root
+
+$logDir = Join-Path $root "logs"
+New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+$stamp = Get-Date -Format "yyyyMMdd_HHmmss"
+$log = Join-Path $logDir "train_$stamp.log"
+
+$arguments = @("train.py", "--rounds", "$Rounds", "--device", $Device)
+if ($Resume -ne "") {
+    $arguments += @("--resume", $Resume)
+}
+
+Write-Host "Logging training output to $log"
+python @arguments 2>&1 | Tee-Object -FilePath $log

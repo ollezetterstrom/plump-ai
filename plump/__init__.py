@@ -1,15 +1,6 @@
-"""plump — clean, decoupled Plump AI package.
+"""Plump: hybrid Rust engine + PyTorch self-play AI."""
 
-Subpackages are intentionally isolated:
-- plump.env      : pure game rules, no torch, no encode
-- plump.encode   : state → tensor, depends on env only
-- plump.models   : networks, depends on encode dims only
-- plump.training : buffers / runners / learners, composes above
-- plump.eval     : evaluation harness
-- plump.play     : human vs AI CLI
-- plump.config   : single source of truth
+from .config import PlumpTransformerConfig, TrainConfig
+from .models.transformer import PlumpTransformer
 
-House rules (v2): 0-bid success = 5 pts, highest bidder (earliest tie) leads.
-"""
-
-__version__ = "2.0.0-house"
+__all__ = ["PlumpTransformer", "PlumpTransformerConfig", "TrainConfig"]

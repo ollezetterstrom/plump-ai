@@ -1,209 +1,269 @@
-# plump/models/transformer.py — FableDan-style causal transformer for Plump.
-# Decoupled: no env, no encode mutation. Restart-from-scratch ready, league includes old DQN.
+"""Causal RoPE Transformer with distributional, belief and trick heads."""
 
 from __future__ import annotations
 
+from typing import Optional, Tuple, Union
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ..encode.tokenizer import VOCAB, MAX_SEQ, PAD_TOK, FEAT_DIM
-
-
-class PlumpTransformerConfig:
-    def __init__(
-        self,
-        vocab: int = VOCAB,
-        d_model: int = 128,
-        n_blocks: int = 4,
-        n_heads: int = 4,
-        qk_dim: int = 32,
-        v_dim: int = 32,
-        ffn_hidden: int = 512,
-        hand_hidden: int = 256,
-        n_hand_layers: int = 2,
-        q_hidden: int = 512,
-        n_q_layers: int = 2,
-        max_seq: int = MAX_SEQ,
-        ntp_weight: float = 0.02,
-        belief_weight: float = 0.05,
-        feat_dim: int = FEAT_DIM,
-    ):
-        self.vocab = vocab
-        self.d_model = d_model
-        self.n_blocks = n_blocks
-        self.n_heads = n_heads
-        self.qk_dim = qk_dim
-        self.v_dim = v_dim
-        self.ffn_hidden = ffn_hidden
-        self.hand_hidden = hand_hidden
-        self.n_hand_layers = n_hand_layers
-        self.q_hidden = q_hidden
-        self.n_q_layers = n_q_layers
-        self.max_seq = max_seq
-        self.ntp_weight = ntp_weight
-        self.belief_weight = belief_weight
-        self.feat_dim = feat_dim
-
-    def to_dict(self):
-        return dict(self.__dict__)
-
-    @classmethod
-    def from_dict(cls, d):
-        c = cls()
-        for k, v in d.items():
-            if hasattr(c, k):
-                setattr(c, k, v)
-        return c
+from plump.config import PlumpTransformerConfig
 
 
 class RMSNorm(nn.Module):
-    def __init__(self, dim, eps=1e-6):
+    def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(dim))
         self.eps = eps
 
-    def forward(self, x):
-        var = x.float().pow(2).mean(-1, keepdim=True)
-        x = x * torch.rsqrt(var + self.eps).to(x.dtype)
-        return x * self.weight
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        dtype = x.dtype
+        xf = x.float()
+        xf = xf * torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        return (xf * self.weight.float()).to(dtype)
 
 
-def build_rope(max_seq, dim, theta=10000.0):
-    half = dim // 2
-    if half == 0:
-        return torch.zeros(max_seq, 1), torch.zeros(max_seq, 1)
-    freqs = 1.0 / (theta ** (torch.arange(0, half).float() / half))
-    t = torch.arange(max_seq).float()
-    ang = torch.outer(t, freqs)
-    return torch.cos(ang), torch.sin(ang)
+class RoPE(nn.Module):
+    """Rotary position embeddings over adjacent dimension pairs."""
+
+    def __init__(self, dim: int, max_seq: int, base: float = 10000.0):
+        super().__init__()
+        assert dim % 2 == 0
+        inv_freq = 1.0 / (
+            base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim)
+        )
+        positions = torch.arange(max_seq, dtype=torch.float32)
+        freqs = torch.outer(positions, inv_freq)
+        self.register_buffer("cos_cached", freqs.cos(), persistent=False)
+        self.register_buffer("sin_cached", freqs.sin(), persistent=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, H, T, D]
+        t = x.shape[-2]
+        dtype = x.dtype
+        cos = self.cos_cached[:t].to(dtype=torch.float32)
+        sin = self.sin_cached[:t].to(dtype=torch.float32)
+        cos = cos.repeat_interleave(2, dim=-1)[None, None, :, :]
+        sin = sin.repeat_interleave(2, dim=-1)[None, None, :, :]
+
+        xf = x.float()
+        even = xf[..., ::2]
+        odd = xf[..., 1::2]
+        rotated = torch.stack((-odd, even), dim=-1).flatten(-2)
+        return (xf * cos + rotated * sin).to(dtype)
 
 
-def apply_rope(x, cos, sin):
-    d = x.shape[-1] // 2
-    if d == 0:
+class SwiGLU(nn.Module):
+    def __init__(self, d_model: int, hidden: int):
+        super().__init__()
+        self.gate = nn.Linear(d_model, hidden, bias=False)
+        self.up = nn.Linear(d_model, hidden, bias=False)
+        self.down = nn.Linear(hidden, d_model, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down(F.silu(self.gate(x)) * self.up(x))
+
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, cfg: PlumpTransformerConfig):
+        super().__init__()
+        self.n_heads = cfg.n_heads
+        self.qk_dim = cfg.qk_dim
+        self.v_dim = cfg.v_dim
+        self.q_proj = nn.Linear(cfg.d_model, cfg.n_heads * cfg.qk_dim, bias=False)
+        self.k_proj = nn.Linear(cfg.d_model, cfg.n_heads * cfg.qk_dim, bias=False)
+        self.v_proj = nn.Linear(cfg.d_model, cfg.n_heads * cfg.v_dim, bias=False)
+        self.o_proj = nn.Linear(cfg.n_heads * cfg.v_dim, cfg.d_model, bias=False)
+        self.q_norm = RMSNorm(cfg.qk_dim)
+        self.k_norm = RMSNorm(cfg.qk_dim)
+        self.rope = RoPE(cfg.qk_dim, cfg.max_seq)
+        self.dropout = cfg.dropout
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, t, _ = x.shape
+        q = self.q_proj(x).view(b, t, self.n_heads, self.qk_dim).transpose(1, 2)
+        k = self.k_proj(x).view(b, t, self.n_heads, self.qk_dim).transpose(1, 2)
+        v = self.v_proj(x).view(b, t, self.n_heads, self.v_dim).transpose(1, 2)
+
+        q = self.rope(self.q_norm(q))
+        k = self.rope(self.k_norm(k))
+
+        y = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            dropout_p=self.dropout if self.training else 0.0,
+            is_causal=True,
+        )
+        y = y.transpose(1, 2).reshape(b, t, self.n_heads * self.v_dim)
+        return self.o_proj(y)
+
+
+class TransformerBlock(nn.Module):
+    def __init__(self, cfg: PlumpTransformerConfig):
+        super().__init__()
+        self.norm1 = RMSNorm(cfg.d_model)
+        self.attn = CausalSelfAttention(cfg)
+        self.norm2 = RMSNorm(cfg.d_model)
+        self.ffn = SwiGLU(cfg.d_model, cfg.ffn_hidden)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.attn(self.norm1(x))
+        x = x + self.ffn(self.norm2(x))
         return x
-    x1, x2 = x[..., :d], x[..., d:]
-    c = cos[None, None, : x.shape[2], :]
-    s = sin[None, None, : x.shape[2], :]
-    return torch.cat([x1 * c - x2 * s, x1 * s + x2 * c], dim=-1)
 
 
-class Attention(nn.Module):
-    def __init__(self, cfg: PlumpTransformerConfig):
+class DuelingHead(nn.Module):
+    """value + advantage - mean(advantage) for a discrete action set."""
+
+    def __init__(self, in_dim: int, hidden: int, n_actions: int):
         super().__init__()
-        h, qk, v = cfg.n_heads, cfg.qk_dim, cfg.v_dim
-        self.h, self.qk, self.v = h, qk, v
-        self.q_proj = nn.Linear(cfg.d_model, h * qk, bias=False)
-        self.k_proj = nn.Linear(cfg.d_model, h * qk, bias=False)
-        self.v_proj = nn.Linear(cfg.d_model, h * v, bias=False)
-        self.out_proj = nn.Linear(h * v, cfg.d_model, bias=False)
-        self.q_norm = RMSNorm(qk)
-        self.k_norm = RMSNorm(qk)
+        self.trunk = nn.Sequential(
+            nn.Linear(in_dim, hidden),
+            nn.SiLU(),
+        )
+        self.value = nn.Linear(hidden, 1)
+        self.advantage = nn.Linear(hidden, n_actions)
 
-    def forward(self, x, cos, sin):
-        B, T, _ = x.shape
-        q = self.q_proj(x).view(B, T, self.h, self.qk).transpose(1, 2)
-        k = self.k_proj(x).view(B, T, self.h, self.qk).transpose(1, 2)
-        v = self.v_proj(x).view(B, T, self.h, self.v).transpose(1, 2)
-        q = apply_rope(self.q_norm(q), cos, sin)
-        k = apply_rope(self.k_norm(k), cos, sin)
-        o = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        o = o.transpose(1, 2).reshape(B, T, self.h * self.v)
-        return self.out_proj(o)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.trunk(x)
+        value = self.value(h)
+        advantage = self.advantage(h)
+        return value + advantage - advantage.mean(dim=-1, keepdim=True)
 
 
-class FFN(nn.Module):
-    def __init__(self, cfg: PlumpTransformerConfig):
+class HandTrunk(nn.Module):
+    def __init__(self, feat_dim: int, hidden: int):
         super().__init__()
-        self.gate_proj = nn.Linear(cfg.d_model, cfg.ffn_hidden, bias=False)
-        self.up_proj = nn.Linear(cfg.d_model, cfg.ffn_hidden, bias=False)
-        self.down_proj = nn.Linear(cfg.ffn_hidden, cfg.d_model, bias=False)
+        self.norm = nn.LayerNorm(feat_dim)
+        self.net = nn.Sequential(
+            nn.Linear(feat_dim, hidden),
+            nn.SiLU(),
+            nn.LayerNorm(hidden),
+            nn.Linear(hidden, hidden),
+        )
 
-    def forward(self, x):
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
-
-
-class Block(nn.Module):
-    def __init__(self, cfg: PlumpTransformerConfig):
-        super().__init__()
-        self.attn_norm = RMSNorm(cfg.d_model)
-        self.attn = Attention(cfg)
-        self.ffn_norm = RMSNorm(cfg.d_model)
-        self.ffn = FFN(cfg)
-
-    def forward(self, x, cos, sin):
-        x = x + self.attn(self.attn_norm(x), cos, sin)
-        x = x + self.ffn(self.ffn_norm(x))
-        return x
-
-
-def _mlp(in_dim, hidden, n_hidden, out_dim):
-    layers = [nn.Linear(in_dim, hidden), nn.ReLU()]
-    for _ in range(n_hidden - 1):
-        layers += [nn.Linear(hidden, hidden), nn.ReLU()]
-    layers.append(nn.Linear(hidden, out_dim))
-    return nn.Sequential(*layers)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(self.norm(x))
 
 
 class PlumpTransformer(nn.Module):
-    """Transformer for Plump with Q-head + NTP + belief (training only).
+    """Causal RoPE policy/return model for Plump.
 
-    Forward for DMC: tokens [B,T], hand_feats [B, F], legal mask optional -> Q [B, A].
-    Action space is unified 52 play + 11 bid, but we mask.
-    For simplicity we have separate Q heads for bid/play but shared encoder.
+    The model consumes the engine's 96-token event stream and the 296-float
+    state vector, then produces:
+      * dueling Q-values for bids 0..10 and cards 0..51,
+      * per-opponent belief logits for all 52 cards,
+      * a categorical distribution over final tricks 0..10.
     """
 
-    def __init__(self, cfg: PlumpTransformerConfig | None = None, bid_actions: int = 11, play_actions: int = 52):
+    def __init__(self, cfg: Optional[PlumpTransformerConfig] = None):
         super().__init__()
         self.cfg = cfg or PlumpTransformerConfig()
-        cfg = self.cfg
-        self.token_emb = nn.Embedding(cfg.vocab, cfg.d_model)
-        self.blocks = nn.ModuleList(Block(cfg) for _ in range(cfg.n_blocks))
-        self.final_norm = RMSNorm(cfg.d_model)
-        cos, sin = build_rope(cfg.max_seq, cfg.qk_dim)
-        self.register_buffer("rope_cos", cos, persistent=True)
-        self.register_buffer("rope_sin", sin, persistent=True)
+        c = self.cfg
 
-        self.hand_mlp = _mlp(cfg.feat_dim, cfg.hand_hidden, cfg.n_hand_layers, cfg.hand_hidden)
-        # Q heads: bid 11, play 52 — share context + hand
-        self.q_bid = _mlp(cfg.d_model + cfg.hand_hidden, cfg.q_hidden, cfg.n_q_layers, bid_actions)
-        self.q_play = _mlp(cfg.d_model + cfg.hand_hidden, cfg.q_hidden, cfg.n_q_layers, play_actions)
-        # Aux heads (training only)
-        self.ntp_head = nn.Linear(cfg.d_model, cfg.vocab)  # next token
-        self.belief_head = nn.Linear(cfg.d_model, 52)  # predict opp hand one-hot 52
+        self.token_emb = nn.Embedding(c.vocab, c.d_model)
+        self.blocks = nn.ModuleList(
+            [TransformerBlock(c) for _ in range(c.n_blocks)]
+        )
+        self.final_norm = RMSNorm(c.d_model)
+        self.hand_trunk = HandTrunk(c.feat_dim, c.hand_hidden)
 
-    def encode_seq(self, tokens: torch.Tensor, lengths: torch.Tensor | None = None):
-        # tokens: [B,T]
-        B, T = tokens.shape
+        joint_dim = c.d_model + c.hand_hidden
+        self.bid_head = DuelingHead(joint_dim, c.q_hidden, c.n_bid_actions)
+        self.play_head = DuelingHead(joint_dim, c.q_hidden, c.n_play_actions)
+        self.belief_head = nn.Linear(joint_dim, 3 * 52)
+        self.tricks_dist_head = nn.Linear(joint_dim, c.n_tricks)
+
+    def encode_seq(
+        self, tokens: torch.Tensor, hand_feats: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if tokens.dim() == 1:
+            tokens = tokens.unsqueeze(0)
+        if hand_feats.dim() == 1:
+            hand_feats = hand_feats.unsqueeze(0)
+
+        lengths = (tokens != 0).sum(dim=1)
+        max_t = max(2, int(lengths.max().item()))
+        max_t = min(max_t, tokens.shape[1])
+        tokens = tokens[:, :max_t]
+
         x = self.token_emb(tokens)
-        cos = self.rope_cos[:T]
-        sin = self.rope_sin[:T]
-        for blk in self.blocks:
-            x = blk(x, cos, sin)
+        for block in self.blocks:
+            x = block(x)
         x = self.final_norm(x)
-        # last non-pad token per sequence
-        if lengths is not None:
-            idx = (lengths - 1).clamp(min=0)
-            ctx = x[torch.arange(B, device=x.device), idx]
+
+        idx = (lengths - 1).clamp(min=0, max=max_t - 1)
+        ctx = x[torch.arange(x.shape[0], device=x.device), idx]
+        hand_emb = self.hand_trunk(hand_feats)
+        joint = torch.cat([ctx, hand_emb], dim=-1)
+        return ctx, hand_emb, joint
+
+    def forward_with_aux(
+        self,
+        tokens: torch.Tensor,
+        hand_feats: torch.Tensor,
+        phase: str = "play",
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        _, _, joint = self.encode_seq(tokens, hand_feats)
+        if phase.lower() in ("bid", "bidding"):
+            q = self.bid_head(joint)
         else:
-            ctx = x[:, -1, :]
-        return ctx, x  # ctx [B,d], full [B,T,d]
+            q = self.play_head(joint)
+        belief_logits = self.belief_head(joint).view(-1, 3, 52)
+        tricks_logits = self.tricks_dist_head(joint)
+        return q, belief_logits, tricks_logits
 
-    def forward(self, tokens: torch.Tensor, hand_feats: torch.Tensor, phase: str = "play"):
-        # tokens [B,T], hand_feats [B, F]
-        lengths = (tokens != PAD_TOK).sum(dim=1)
-        ctx, full = self.encode_seq(tokens, lengths)
-        hand_emb = self.hand_mlp(hand_feats)
-        cat = torch.cat([ctx, hand_emb], dim=-1)
-        if phase == "bid":
-            return self.q_bid(cat)
-        return self.q_play(cat)
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        hand_feats: torch.Tensor,
+        phase: str = "play",
+    ) -> torch.Tensor:
+        _, _, joint = self.encode_seq(tokens, hand_feats)
+        if phase.lower() in ("bid", "bidding"):
+            return self.bid_head(joint)
+        return self.play_head(joint)
 
-    def forward_with_aux(self, tokens, hand_feats, phase="play"):
-        q = self.forward(tokens, hand_feats, phase)
-        # aux: ntp on full sequence
-        _, full = self.encode_seq(tokens)
-        ntp_logits = self.ntp_head(full)  # [B,T,V]
-        belief = self.belief_head(full[:, -1, :])  # [B,52]
-        return q, ntp_logits, belief
+    def predict_belief_probs(
+        self,
+        tokens: Union[torch.Tensor, np.ndarray],
+        hand_feats: Union[torch.Tensor, np.ndarray],
+    ) -> np.ndarray:
+        """Return sigmoid belief probabilities for relative opponents +1,+2,+3.
+
+        A single (unbatched) observation returns shape ``[3, 52]``; a batch
+        returns ``[B, 3, 52]``.
+        """
+        squeezed = isinstance(tokens, np.ndarray) and tokens.ndim == 1
+        device = next(self.parameters()).device
+        dtype = next(self.parameters()).dtype
+
+        if isinstance(tokens, np.ndarray):
+            tokens_t = torch.from_numpy(tokens).long()
+        else:
+            tokens_t = tokens.long()
+        if isinstance(hand_feats, np.ndarray):
+            feats_t = torch.from_numpy(hand_feats).float()
+        else:
+            feats_t = hand_feats.float()
+
+        if tokens_t.dim() == 1:
+            tokens_t = tokens_t.unsqueeze(0)
+            squeezed = True
+        if feats_t.dim() == 1:
+            feats_t = feats_t.unsqueeze(0)
+
+        tokens_t = tokens_t.to(device)
+        feats_t = feats_t.to(device=device, dtype=dtype)
+
+        with torch.no_grad():
+            _, belief_logits, _ = self.forward_with_aux(
+                tokens_t, feats_t, phase="play"
+            )
+            probs = torch.sigmoid(belief_logits.float()).cpu().numpy()
+        if squeezed:
+            return probs[0]
+        return probs
