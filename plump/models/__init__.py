@@ -1,5 +1,19 @@
-from .dqn import DuelingQNetwork
+from .transformer import (
+    CausalSelfAttention,
+    DuelingHead,
+    PlumpTransformer,
+    RMSNorm,
+    RoPE,
+    SwiGLU,
+    TransformerBlock,
+)
 
-# Future: from .transformer import PlumpTransformer
-
-__all__ = ["DuelingQNetwork"]
+__all__ = [
+    "CausalSelfAttention",
+    "DuelingHead",
+    "PlumpTransformer",
+    "RMSNorm",
+    "RoPE",
+    "SwiGLU",
+    "TransformerBlock",
+]

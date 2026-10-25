@@ -1,4 +1,5 @@
-from .buffers import ReplayBuffer
-from .rewards import shaped_reward
+from .buffer import RingBuffer
+from .league import League
+from .trainer import PlumpTrainer
 
-__all__ = ["ReplayBuffer", "shaped_reward"]
+__all__ = ["RingBuffer", "League", "PlumpTrainer"]

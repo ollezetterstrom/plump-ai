@@ -1,0 +1,333 @@
+Starting from a clean slate without the old legacy code is the right call—it eliminates all the old `222/226/278/294` DQN baggage and lets your OpenCode agent build a unified **Hybrid Rust + PyTorch** architecture around your exact Swedish house rules from day one.
+
+### How to Use These Prompts with OpenCode
+1. Create a **new, empty folder** (e.g., `plump-v3`) and open OpenCode in it.
+2. Make sure you have **Rust (`cargo`)** and **Python 3.10+** (with PyTorch installed for your RX 9060 XT) on your machine.
+3. **Paste the 5 prompts below one at a time.** Wait for OpenCode to finish Prompt 1 and pass its verification command before pasting Prompt 2, and so on.
+
+---
+
+### PROMPT 1 of 5: Project Setup & Rust `u64` Bitboard Game Engine (`crates/plump-engine`)
+
+*Copy and paste this first into OpenCode:*
+
+```markdown
+We are building a high-performance AI for the Swedish card game "Plump" from scratch using a Hybrid Rust + PyTorch architecture.
+Do NOT write any Python training code yet. In this first step, create the workspace structure and the core Rust bitboard engine (`crates/plump-engine`) with unit tests verifying all house rules.
+
+### Exact House Rules (CRITICAL — Must Be Followed Strictly)
+1. **Players & Deck**: 4 players (seats `0, 1, 2, 3`). Standard 52-card deck: 4 suits (`0=H, 1=S, 2=D, 3=C`), 13 ranks (`2..=14`, where `11=J, 12=Q, 13=K, 14=A`).
+   - Card index: `card_idx = suit * 13 + (rank - 2)` in `0..52`.
+   - Bitboard representation: `1u64 << card_idx`. Suit mask for `suit` in `0..4`: `0x1FFFu64 << (suit * 13)`.
+2. **Full Game Round Schedule (20 Rounds)**:
+   - A full match consists of 20 rounds: `10 down to 1, then 1 back up to 10`:
+     `[10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]`.
+3. **Rotating Dealer & Bidding Order**:
+   - Each round has a `start_bidder: u8` (`0..4`), which is the player beside the shuffler/dealer. Across a match, `start_bidder` rotates each round: `round_idx % 4`.
+   - Bidding proceeds in order: `offset = 0, 1, 2, 3` where `player = (start_bidder + offset) % 4`.
+   - The first 3 bidders (`offset < 3`) can bid any integer in `0..=round_cards`.
+   - **Last Bidder ("Hook" / "Gå går inte") Rule**: The 4th bidder (`offset == 3`, the dealer) can bid any integer in `0..=round_cards` EXCEPT the number `forbidden = round_cards as i32 - sum_of_first_3_bids`. The sum of all 4 bids may NEVER equal `round_cards`.
+4. **Who Leads Trick 1 (Earliest Highest Bidder in Bidding Order)**:
+   - Once all 4 bids are placed, the player who bid the highest number leads the first card of Trick 1.
+   - **Tie-breaker**: If two or more players bid the same highest amount, the player who **said it first in the bidding order** (`offset = 0..4` from `start_bidder`) leads Trick 1!
+5. **1-Card Round = "Pannplump" / Forehead Rule**:
+   - Whenever `round_cards == 1`, players hold their single card on their forehead:
+   - **A player CANNOT see their own card (`own_hand` is hidden/masked to 0), and instead CAN see the exact cards held by the other 3 players!**
+   - Whenever `round_cards >= 2`, players see their own hand normally and cannot see opponents' hands.
+6. **Trick-Taking Play Rules**:
+   - **No Trump**: There is no trump suit.
+   - **Must Follow Suit (Färgtvång)**: The first card played in a trick sets `led_suit` (`0..4`). Subsequent players in the trick MUST play a card of `led_suit` if they hold one.
+   - **No Obligation to Beat**: Players only have to follow suit; they do NOT have to play a higher rank.
+   - **Void (Saka)**: If a player has no cards of `led_suit`, they may play any card in their hand, and `void_mask[player] |= 1 << led_suit` is recorded publicly. Off-suit cards can never win a trick.
+   - **Trick Winner**: The player who played the highest rank of `led_suit` wins the trick, increments `tricks_won[winner]`, and leads the next trick.
+7. **Scoring**:
+   - **Display Points (Scoreboard)**:
+     * If `tricks_won == bid`: `5` points if `bid == 0`, else `10 + bid` points.
+     * If `tricks_won != bid` (Plump): `0` points.
+   - **RL Terminal Reward (`terminal_reward`)**:
+     * If `tricks_won == bid`: `5.0` if `bid == 0` else `10.0 + bid as f32`.
+     * If `tricks_won != bid`: `-2.0 * (tricks_won as f32 - bid as f32).abs()`.
+
+### Files to Create in Step 1
+1. `Cargo.toml` (workspace root) and `pyproject.toml` (configured for `maturin` pointing to `crates/plump-engine/Cargo.toml`).
+2. `crates/plump-engine/Cargo.toml`:
+   - Dependencies: `rand = "0.8"`, `rayon = "1.10"`, `pyo3 = { version = "0.22", features = ["extension-module"], optional = true }`, `numpy = { version = "0.22", optional = true }`.
+   - Features: `default = []`, `python = ["dep:pyo3", "dep:numpy"]`.
+3. `crates/plump-engine/src/lib.rs` and `crates/plump-engine/src/engine.rs`:
+   - Implement `#[derive(Clone, Copy, Debug)] pub struct FastEnv`:
+     ```rust
+     pub const VOCAB: usize = 70;
+     pub const MAX_SEQ: usize = 96;
+     pub const FEAT_DIM: usize = 296;
+
+     pub const PAD_TOK: u8 = 0;
+     pub const BOS_TOK: u8 = 1;
+     pub const BID_BASE: u8 = 2;     // 2..=12 (bids/round_cards 0..=10)
+     pub const PLAYER_BASE: u8 = 13; // 13..=16 (relative player 0..=3)
+     pub const CARD_BASE: u8 = 17;   // 17..=68 (card_idx 0..=51)
+
+     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+     pub enum Phase {
+         Bidding,
+         Playing,
+         Terminal,
+     }
+
+     #[derive(Clone, Copy, Debug)]
+     pub struct FastEnv {
+         pub hands: [u64; 4],
+         pub played: u64,
+         pub void_mask: [u8; 4],
+         pub bids: [i8; 4],
+         pub tricks_won: [u8; 4],
+         pub table: [(u8, u8); 4], // (player, card_idx)
+         pub table_len: u8,
+         pub led_suit: u8,         // 255 if none, else 0..4
+         pub round_cards: u8,
+         pub current_trick: u8,
+         pub start_bidder: u8,
+         pub bids_made: u8,
+         pub current_player: u8,
+         pub phase: Phase,
+         pub history_events: [(u8, u8, u8); 44], // (kind: 0=bid, 1=play; abs_player; payload: bid or card_idx)
+         pub history_len: u8,
+     }
+     ```
+   - Implement:
+     * `new_round(&mut self, round_cards: u8, start_bidder: u8, rng: &mut impl Rng)`
+     * `legal_bids_mask(&self, player: usize) -> u16` (11-bit mask for bids `0..=10`)
+     * `legal_cards_mask(&self, player: usize) -> u64` (52-bit mask using O(1) bitboard ops:
+       `let suit_mask = 0x1FFFu64 << (self.led_suit as usize * 13); let in_suit = hand & suit_mask; if in_suit != 0 { in_suit } else { hand }`)
+     * `get_leader(&self) -> usize` (iterates `offset in 0..4`, `p = (self.start_bidder as usize + offset) % 4`, returns earliest highest bidder)
+     * `step_bid(&mut self, bid: u8)` (records bid, updates `bids_made`, transitions to `Phase::Playing` with `current_player = self.get_leader() as u8` when `bids_made == 4`)
+     * `step_play(&mut self, card_idx: u8) -> Option<usize>` (removes bit from `hands[p]`, updates `void_mask` if off-suit, appends to `table` and `history_events`; when `table_len == 4`, resolves trick winner, increments `tricks_won[winner]`, updates `played`, advances `current_trick`, sets `Phase::Terminal` if `current_trick == round_cards`, and returns `Some(winner)`)
+     * `encode_decision(&self, viewer: usize, toks_out: &mut [i64; MAX_SEQ], feats_out: &mut [f32; FEAT_DIM], opp_hands_out: &mut [f32; 156])`:
+       - **Tokens (`MAX_SEQ = 96`)**:
+         `toks[0] = BOS_TOK`, `toks[1] = BID_BASE + round_cards`. Then for each event in `history_events[..history_len]`:
+         `rel_p = (abs_p + 4 - viewer) % 4`. Emit `PLAYER_BASE + rel_p`, then `BID_BASE + payload` (if bid) or `CARD_BASE + payload` (if play). Pad remaining up to 96 with `PAD_TOK (0)`.
+       - **Features (`FEAT_DIM = 296`)**:
+         * `0..52`: `own_hand` one-hot IF `round_cards >= 2`, else **all `0.0`** when `round_cards == 1` (Pannplump rule!).
+         * `52..208` (`3 * 52`): `forehead_opp_cards` — IF `round_cards == 1`, for `i in 0..3`, set `52 + i*52 + card_idx = 1.0` for the cards in `hands[(viewer + i + 1) % 4]`. IF `round_cards >= 2`, all `0.0`!
+         * `208..260` (`52`): `played` cards one-hot.
+         * `260..276` (`16`): `void_mask` relative to viewer (`rel_p * 4 + suit`).
+         * `276..280` (`4`): `bids` relative to viewer (`b as f32 / 10.0` if `b >= 0` else `-0.1`).
+         * `280..284` (`4`): `tricks_won` relative to viewer (`t as f32 / 10.0`).
+         * `284..288` (`4`): `tricks_needed` relative to viewer (`(b - t) as f32 / 10.0` if `b >= 0` else `0.0`).
+         * `288..292` (`4`): `bidding_order_pos` one-hot (`(viewer + 4 - start_bidder) % 4`).
+         * `292..296` (`4`): `led_suit` one-hot (`0..4` if `led_suit < 4`).
+       - **`opp_hands_out` (`156 = 3 * 52`)**: Ground-truth one-hot of cards held by relative opponents `+1, +2, +3` (used as training target for the Transformer's `belief_head`).
+
+### Verification for Step 1
+Run `cargo test` and verify tests pass for:
+1. Rotating `start_bidder` (`0, 1, 2, 3`) and earliest-in-bidding-order tie-breaking in `get_leader()`.
+2. Last-bidder forbidden sum ("Gå går inte") for every `start_bidder`.
+3. `round_cards == 1` (Pannplump): `feats[0..52]` is all zeros and `feats[52..208]` contains the exact 3 opponent cards; for `round_cards >= 2`, `feats[0..52]` has `viewer`'s cards and `feats[52..208]` is all zeros.
+4. Bitboard `legal_cards_mask`, void tracking, and scoring (`0-bid = 5.0`, `1+ bid = 10 + bid`).
+```
+
+---
+
+### PROMPT 2 of 5: Rust Vectorized Env, 24x Suit Augmentation, Exact Endgame Solver & PyO3 Bridge
+
+*Once Prompt 1 passes `cargo test`, copy and paste Prompt 2 into OpenCode:*
+
+```markdown
+Great! Now complete the Rust crate (`crates/plump-engine`) by adding:
+1. `src/augment.rs` — 24x Suit-Isomorphism Permutation for training batches.
+2. `src/search.rs` — Belief-Guided Determinized Search (PIMC) + Exact MaxN Endgame Solver.
+3. `src/vec_env.rs` — Parallel `rayon` Vectorized Environment (`RustVecEnv`) for high-throughput GPU training.
+4. `src/python.rs` — PyO3 bindings exposing everything to Python, compiled via `maturin develop --release`.
+
+### Detailed Specifications for Step 2
+
+1. **24x Suit-Isomorphism Augmentation (`crates/plump-engine/src/augment.rs`)**:
+   - Because Plump has no trump suit, the 4 suits (`0, 1, 2, 3`) are 100% mathematically symmetric (`4! = 24` permutations).
+   - Write `pub fn permute_transition(perm: &[u8; 4], toks: &mut [i64; MAX_SEQ], feats: &mut [f32; FEAT_DIM], opp_hands: &mut [f32; 156], is_play: bool, action: &mut i64)`:
+     * Permute card tokens (`17..=68`) in `toks`: `let c = (t - 17) as usize; let new_c = perm[c / 13] as usize * 13 + (c % 13); *t = 17 + new_c as i64;`.
+     * Permute every 52-card block in `feats` (`0..52`, `52..104`, `104..156`, `156..208`, `208..260`) by moving 13-float suit slices according to `perm`.
+     * Permute the 4-suit slices in `feats` (`260..264`, `264..268`, `268..272`, `272..276` for `void_mask`, and `292..296` for `led_suit`).
+     * Permute the three 52-card blocks in `opp_hands` (`0..52`, `52..104`, `104..156`).
+     * If `is_play`: remap `*action = (perm[(*action as usize) / 13] as i64) * 13 + ((*action) % 13)`.
+
+2. **Belief-Guided World Sampling & Exact Endgame Solver (`crates/plump-engine/src/search.rs`)**:
+   - **`sample_consistent_worlds(base: &FastEnv, viewer: usize, n_worlds: usize, belief_probs: Option<&[[f32; 52]; 3]>) -> Vec<FastEnv>`**:
+     * Case A (`base.round_cards == 1` — Pannplump):
+       In a 1-card round, `viewer` ALREADY sees the exact cards of all 3 opponents! Only `viewer`'s own 1 card is unknown (chosen from the 49 remaining cards in the deck, weighted by how likely opponents' bids are if desired, or uniform over the 49 unseen cards).
+     * Case B (`base.round_cards >= 2`):
+       `viewer` knows their own hand `base.hands[viewer]`, `base.played`, and `base.table`. Unknown cards are distributed to the 3 opponents respecting `base.void_mask[p]` and weighted by `belief_probs` (probability that relative opponent `0, 1, 2` holds each card).
+   - **`solve_world_recursive(env: &FastEnv, depth_left: u8) -> [f32; 4]`**:
+     * Because `FastEnv` is `Copy` and uses `u64` bitboards, implement a fast MaxN search:
+     * If `env.phase == Phase::Terminal`, return `[terminal_reward(0), terminal_reward(1), terminal_reward(2), terminal_reward(3)]`.
+     * If `depth_left == 0` (used when `round_cards - current_trick > 5`), finish the rest of the round with a fast heuristic rollout:
+       - If player still needs tricks (`tricks_won < bid`), play highest legal card if it can win the trick, else lowest legal card.
+       - If player already hit their bid (`tricks_won == bid`), play highest legal card that ducks under the current trick winner, else lowest legal card.
+     * When `round_cards - current_trick <= 5` (last 5 tricks of any round), set `depth_left = 20` (4 players * 5 tricks) so Rust solves the determinized world **100% exactly to the end of the round**!
+   - **`search_best_card(base: &FastEnv, viewer: usize, n_worlds: usize, belief_probs: Option<&[[f32; 52]; 3]>) -> u8`**:
+     * Parallelize over `worlds` using `rayon::prelude::*` (`par_iter()`), evaluate every legal card in `base.legal_cards_mask(viewer)`, and return the `card_idx` with the highest average expected `terminal_reward` for `viewer`.
+   - **`search_best_bid_pannplump(base: &FastEnv, viewer: usize, n_samples: usize) -> u8`**:
+     * Special exact Monte-Carlo solver for 1-card Forehead rounds (`round_cards == 1`)!
+     * Since `viewer` sees all 3 opponents' cards, sample all 49 possible unseen cards that could be on `viewer`'s own forehead. For each of the 49 cards, check if `viewer` wins the trick (since there is only 1 card per player, who leads is determined by `bids`). Return the legal bid (`0` or `1`) that maximizes exact expected points!
+
+3. **Vectorized Batched Environment (`crates/plump-engine/src/vec_env.rs`)**:
+   - Implement `RustVecEnv` managing `envs: Vec<FastEnv>` (e.g. `256` parallel games).
+   - Provide methods to:
+     * `observe_batch(&self)` -> returns contiguous NumPy arrays `(toks [N, 96], feats [N, 296], legal_masks [N, 52], is_bid_phase [N], current_players [N])` computed in parallel with `rayon`.
+     * `step_batch(&mut self, actions: &[u8])` -> steps all `N` environments in parallel. Whenever an environment finishes a round (`Phase::Terminal`), compute the full round's transitions for all 4 players:
+       - **Bid return**: `terminal_reward(tricks_won[p], bids[p])`.
+       - **Play return (True Cumulative DMC Return)**: For trick `t` from `0..round_cards`:
+         `G_t = terminal_reward(tricks_won[p], bids[p]) + 0.20 * sum_{k=t..round_cards} shaped_reward(k)`
+         where `shaped_reward(k)` is `+1.0` if won trick & `tricks_won <= bid`, `-1.5` if won trick & `tricks_won > bid`, `-1.0` if lost trick & `tricks_won < bid`, `+0.5` if lost trick & `tricks_won >= bid`.
+       - Automatically reset finished environments to a new round (sampling `round_cards` from the 20-round schedule `[10,9,8,7,6,5,4,3,2,1,1,2,3,4,5,6,7,8,9,10]` and rotating `start_bidder = (start_bidder + 1) % 4`) and return all completed episode transitions so Python can push them straight into the replay buffer!
+
+4. **PyO3 Bridge (`crates/plump-engine/src/python.rs`)**:
+   - Expose `PyFastEnv` (single game wrapper for `play.py` and evaluation, including `search_move(n_worlds, belief_probs)` and `search_pannplump_bid()`) and `PyRustVecEnv` (vectorized training environment) plus `augment_batch_numpy(...)`.
+
+### Verification for Step 2
+1. Run `cargo test` to verify `augment`, `search`, and `vec_env`.
+2. Build the Python extension with `maturin develop --release` (enable the `python` feature) and run a quick `python -c "import plump_engine; print(dir(plump_engine))"` to verify the Rust module imports cleanly into Python.
+```
+
+---
+
+### PROMPT 3 of 5: Python Package & Causal RoPE Transformer with Distributional + Belief Heads
+
+*Once Prompt 2 builds and imports `plump_engine` into Python, paste Prompt 3 into OpenCode:*
+
+```markdown
+Now create the Python package `plump/` containing our Causal RoPE Transformer model (`plump/models/transformer.py`) and configuration (`plump/config.py`).
+
+### Architectural Specifications for `plump/models/transformer.py`
+
+1. **Dimensions & Config (`PlumpTransformerConfig`)**:
+   - `vocab: int = 70`
+   - `max_seq: int = 96`
+   - `feat_dim: int = 296`
+   - `d_model: int = 128`
+   - `n_blocks: int = 4`
+   - `n_heads: int = 4` (`qk_dim = 32`, `v_dim = 32`)
+   - `ffn_hidden: int = 512` (SwiGLU FFN: `down(silu(gate(x)) * up(x))`)
+   - `hand_hidden: int = 256`
+   - `q_hidden: int = 512`
+
+2. **Dynamic Sequence Slicing & Causal RoPE Attention**:
+   - Compute `lengths = (tokens != 0).sum(dim=1)`.
+   - Dynamically slice `max_t = int(lengths.max().item())` (`max_t = max(2, max_t)`) and slice `tokens = tokens[:, :max_t]` before running the Transformer blocks so short rounds don't waste GPU FLOPs on padding tokens.
+   - Use `RMSNorm` on Q and K (`q_norm`, `k_norm`), apply Rotary Position Embeddings (`RoPE`), and use `F.scaled_dot_product_attention(q, k, v, is_causal=True)`.
+   - Extract the context vector `ctx` at the last non-pad token of each sequence: `ctx = x[torch.arange(B, device=x.device), (lengths - 1).clamp(min=0)]`.
+
+3. **Fusion Trunk & Multi-Task Heads**:
+   - Pass `hand_feats` (`[B, 296]`) through a 2-layer MLP with `LayerNorm` + `SiLU` to get `hand_emb` (`[B, 256]`).
+   - Concatenate `joint = torch.cat([ctx, hand_emb], dim=-1)` (`[B, 384]`).
+   - **Dueling Action Heads**:
+     * `q_bid`: Dueling head (`value [B, 1] + advantage [B, 11] - advantage.mean()`) outputting expected return for bids `0..=10`.
+     * `q_play`: Dueling head (`value [B, 1] + advantage [B, 52] - advantage.mean()`) outputting expected return for cards `0..=51`.
+   - **Auxiliary Training Heads (for Superhuman Card Counting & Risk Awareness)**:
+     * `belief_head = nn.Linear(cfg.d_model + cfg.hand_hidden, 3 * 52)`: Predicts logits (`[B, 3, 52]`) for which unseen cards each of the 3 relative opponents (`+1, +2, +3`) currently holds in their hand.
+     * `tricks_dist_head = nn.Linear(cfg.d_model + cfg.hand_hidden, 11)`: Predicts categorical logits (`[B, 11]`) for the final number of tricks (`0..=10`) the viewer will win in this round.
+
+4. **Inference Helper Methods**:
+   - `forward(tokens, hand_feats, phase="play") -> Tensor` (returns `q_bid` or `q_play`).
+   - `forward_with_aux(tokens, hand_feats, phase="play") -> tuple[Tensor, Tensor, Tensor]` (returns `(q, belief_logits, tricks_dist_logits)` in a single pass through `encode_seq`).
+   - `predict_belief_probs(tokens, hand_feats) -> np.ndarray` (returns `torch.sigmoid(belief_logits).cpu().numpy()` of shape `[3, 52]` for feeding directly into Rust `search_best_card`).
+
+### Verification for Step 3
+Write a test script or `pytest` test in `tests/test_model.py` verifying:
+- `PlumpTransformer` forward and `forward_with_aux` shapes for both `"bid"` and `"play"` phases with `bfloat16` autocast.
+- Integration test passing observations from `plump_engine.PyRustVecEnv` directly into `PlumpTransformer`.
+```
+
+---
+
+### PROMPT 4 of 5: High-Throughput Vectorized GPU Trainer + Self-Play League (`train.py`)
+
+*Once Prompt 3 passes its tests, paste Prompt 4 into OpenCode:*
+
+```markdown
+Now implement the high-speed vectorized training pipeline in `plump/training/trainer.py` and the entrypoint `train.py`, plus `start_overnight.ps1`.
+
+### Training Pipeline Requirements (Optimized for AMD RX 9060 XT on Windows 11)
+
+1. **Vectorized Lockstep Execution (`PyRustVecEnv`)**:
+   - Instantiate `vec_env = plump_engine.PyRustVecEnv(num_envs=256)`.
+   - In each step of the main loop:
+     * Obtain the batch of 256 active states `(toks, feats, legal_masks, is_bid_phase, current_players)` from Rust.
+     * Assign each seat in each environment to either the **Learner** (seats `0, 1, 2, 3` in pure self-play games, or 2 learner seats + 2 frozen League opponent seats in league games so the learner trains equally on **all 4 seat positions** and all dealer/bidding orders!).
+     * Split indices into `bid_indices` (`is_bid_phase == True`) and `play_indices` (`is_bid_phase == False`) and run **one batched GPU forward pass** for bidding and **one batched GPU forward pass** for playing using `torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)` (if `cuda` is available).
+     * Apply epsilon-greedy exploration over `legal_masks` (using per-env epsilon ranging from `0.02` to `0.25` across the 256 parallel envs so some envs always explore and some always exploit!).
+     * Step `vec_env.step_batch(actions)` in Rust and collect all completed episode transitions `(toks, feats, action, dmc_return, opp_hands, final_tricks_won, is_play)`.
+
+2. **Fast Circular Ring-Buffer Replay (`plump/training/buffer.py`)**:
+   - Do NOT use Python lists of tuples or `random.sample` on Python lists (which is slow).
+   - Use pre-allocated contiguous NumPy ring buffers (`capacity = 250_000` for play, `capacity = 100_000` for bid) storing `toks (int16)`, `feats (float32)`, `actions (int64)`, `returns (float32)`, `opp_hands (float32 [156])`, `final_tricks (int64)`.
+   - On `sample(batch_size=512)`:
+     * Sample random indices via `np.random.randint(0, size, size=batch_size)`.
+     * Call `plump_engine.augment_batch_numpy(...)` in Rust to randomly permute the 4 suits (`24x Suit Isomorphism Augmentation`) across the sampled batch before moving tensors to the GPU with `non_blocking=True`.
+
+3. **Multi-Task Loss Function**:
+   - Optimizer: `torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-4)`.
+   - For both Bid and Play batches (`batch_size = 512`):
+     * Run `q, belief_logits, tricks_logits = model.forward_with_aux(toks_b, feats_b, phase=phase)`.
+     * `q_taken = q.gather(1, actions_b.unsqueeze(1)).squeeze(1)`
+     * `q_loss = F.smooth_l1_loss(q_taken, returns_b)` (Huber loss is much more stable than MSE for Plump's cliff rewards).
+     * `belief_loss = F.binary_cross_entropy_with_logits(belief_logits.view(-1, 156), opp_hands_b)`
+     * `tricks_loss = F.cross_entropy(tricks_logits, final_tricks_b)`
+     * `total_loss = q_loss + 0.15 * belief_loss + 0.10 * tricks_loss`
+   - Clip gradients with `nn.utils.clip_grad_norm_(model.parameters(), 1.0)`.
+
+4. **Dynamic Evolving Self-Play League & Evaluation**:
+   - Every `5,000` completed rounds:
+     * Evaluate the current learner (with `epsilon = 0.0`) across `400` full rounds in `PyRustVecEnv` (100 rounds in each seat `0, 1, 2, 3`) against the current League Champion (and against a smart heuristic baseline if no champion exists yet).
+     * Print throughput (`rounds/sec`), `Win/Make Bid %`, `Avg Score`, `q_loss`, and `belief_loss`.
+     * Save `plump_transformer_latest.pt` and `plump_transformer_session.txt`.
+     * If `avg_score > best_score`, save `plump_transformer_best.pt` AND dynamically push a frozen snapshot of `model` into the active `League` pool (keeping up to the last 5 distinct champions + heuristic + random) so opponents continuously get stronger without restarting the script!
+   - Handle `KeyboardInterrupt` cleanly so `Ctrl+C` saves `plump_transformer_latest.pt` and `plump_transformer_session.txt`.
+
+### Verification for Step 4
+Run `python train.py --test-run` (add a `--test-run` CLI flag that runs 2,000 rounds, performs 10 gradient updates, runs 1 evaluation pass, saves checkpoints, and exits) and verify it completes cleanly and prints `rounds/sec`.
+```
+
+---
+
+### PROMPT 5 of 5: Rich Interactive CLI (`play.py`) — Full 20-Round Swedish Plump + Forehead UI + Rust Search
+
+*Once Prompt 4 passes `--test-run`, paste this final prompt into OpenCode:*
+
+```markdown
+Now build the rich interactive CLI in `play.py` so a human can play a full 20-round game against 3 AI Champions using our Rust engine and real-time belief-guided search.
+
+### Requirements for `play.py`
+
+1. **Full 20-Round Schedule & Rotating Dealer**:
+   - Rounds: `[10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]`.
+   - `start_bidder = round_idx % 4`. Clearly display at the top of each round who shuffled/dealt (`dealer = (start_bidder + 3) % 4`) and who bids first (`start_bidder`).
+   - Step through bidding in exact order: `for offset in range(4): p = (start_bidder + offset) % 4`.
+   - On the 4th bidder (`offset == 3`), display which bid is forbidden (`"Gå går inte: cannot bid X"`).
+
+2. **1-Card "Pannplump" (Forehead) Round UI**:
+   - When `round_cards == 1`:
+     * **DO NOT show the human player their own card!** Show `"Your Card: [??] (On your forehead!)"`.
+     * Instead, display a panel showing the cards on the foreheads of **AI 1, AI 2, and AI 3**!
+     * For the AI's bids on the 1-card round, combine the Transformer's `q_bid` with Rust's `search_best_bid_pannplump` so the AIs make mathematically sharp forehead bids based on the 3 visible cards and prior bids.
+     * Once all 4 bids are placed on the 1-card round, reveal the human's forehead card dramatic-style and resolve the trick!
+
+3. **Normal Rounds (`round_cards >= 2`) & Real-Time Rust Search (`--search N`)**:
+   - Sort and display the human's hand by suit and rank using `rich` colors (`H` and `D` in bold red, `S` and `C` in bold cyan/blue).
+   - Highlight who won the bid and leads Trick 1 (`"Highest bid X by <Player> (earliest in bidding order) leads Trick 1"`).
+   - Add CLI argument `--search` (default `32` worlds, `0` for greedy).
+   - When an AI plays a card and `--search > 0`:
+     * Query the Transformer for `belief_probs = model.predict_belief_probs(toks, feats)` (`[3, 52]`).
+     * Call `env.search_move(n_worlds=args.search, belief_probs=belief_probs)` in Rust (`plump_engine`), which runs belief-weighted determinization in parallel across all CPU cores and **solves the last 5 tricks of every round 100% exactly**.
+
+4. **Scoreboard & Plump Tracking**:
+   - After each round, display a `rich` table showing `Player`, `Bid`, `Tricks Won`, `Status` (`PASSED` vs `PLUMP`), `Round Points` (`+5` for made 0-bid, `+10+bid` for made 1+ bid, `+0` for Plump), `Total Plumps`, and `Total Score`.
+
+### Verification for Step 5
+Add an automated `--autoplay` flag to `play.py` that plays a full 20-round game with `--search 16` where Seat 0 is also controlled by the AI, and run `python play.py --autoplay --search 16` to verify the entire 20-round loop (including both 1-card Pannplump rounds in the middle, rotating dealers, earliest-highest-bidder leads, and Rust endgame search) runs from Round 1 to Round 20 with zero errors!
+```
+
+---
+
+### What This Gives You Once OpenCode Finishes All 5 Prompts
+1. **100% Authentic to Your Table Rules:** Rotating shuffler/starting bidder, dealer hook restriction (`gå går inte`), earliest-in-bidding-order tie-breaker for leading Trick 1, `10 -> 1 -> 1 -> 10` (20 rounds), `0-bid = 5 pts`, and true **Pannplump (forehead cards)** on the two 1-card rounds.
+2. **Massive Speedup on Your RX 9060 XT:** Because 256 games run in parallel on Rust `u64` bitboards (`rayon`) and feed single `[256, T]` `bfloat16` batches to PyTorch, training jumps from ~30 rounds/sec to **1,500–3,000+ rounds/sec**, plus **24x Suit Isomorphism** multiplies every round by 24 equivalent suit permutations.
+3. **Unbeatable Endgame Play:** During `play.py`, the Transformer predicts which hidden cards your opponents hold (`belief_head`), and Rust solves the last 5 tricks of every round **100% mathematically perfectly** across 32 belief-sampled worlds in a few milliseconds.

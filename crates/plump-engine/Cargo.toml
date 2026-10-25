@@ -1,8 +1,8 @@
 [package]
 name = "plump-engine"
-version = "0.2.0"
+version = "0.1.0"
 edition = "2021"
-description = "Plump engine — pure Rust rules + deep search (MCTS determinization)"
+description = "Rust bitboard engine for the Swedish card game Plump"
 license = "MIT"
 
 [lib]
@@ -11,3 +11,10 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 rand = "0.8"
+rayon = "1.10"
+pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
+numpy = { version = "0.22", optional = true }
+
+[features]
+default = []
+python = ["dep:pyo3", "dep:numpy"]
