@@ -101,7 +101,14 @@ def test_head_to_head_margin_evaluation_and_league_promotion(tmp_path):
         "made_rate": 0.5,
         "avg_tricks": 2.0,
     }
+    dummy_gauntlet = lambda score=10.0, margin=5.0: {
+        "Rookie": {"ai_avg_points": score, "bot_avg_points": score - margin, "margin": margin, "made_rate": 0.5, "avg_tricks": 2.0, "rounds": 8},
+        "Regular": {"ai_avg_points": score, "bot_avg_points": score - margin, "margin": margin, "made_rate": 0.5, "avg_tricks": 2.0, "rounds": 8},
+        "Tactician": {"ai_avg_points": score, "bot_avg_points": score - margin, "margin": margin, "made_rate": 0.5, "avg_tricks": 2.0, "rounds": 8},
+        "Final Boss": {"ai_avg_points": score, "bot_avg_points": score - margin, "margin": margin, "made_rate": 0.5, "avg_tricks": 2.0, "rounds": 8},
+    }
     trainer.evaluate = lambda: metrics_win
+    trainer.evaluate_gauntlet = lambda: dummy_gauntlet(10.0, 5.0)
     trainer._evaluate_and_checkpoint()
     assert len(trainer.league) == 1
     assert trainer.best_score == 10.0
@@ -115,6 +122,7 @@ def test_head_to_head_margin_evaluation_and_league_promotion(tmp_path):
         "avg_tricks": 2.0,
     }
     trainer.evaluate = lambda: metrics_tie
+    trainer.evaluate_gauntlet = lambda: dummy_gauntlet(12.0, 0.0)
     trainer._evaluate_and_checkpoint()
     assert len(trainer.league) == 1  # Not promoted!
 
@@ -131,6 +139,7 @@ def test_head_to_head_margin_evaluation_and_league_promotion(tmp_path):
         for p in trainer.model.parameters():
             p.add_(torch.randn_like(p) * 0.01)
     trainer.evaluate = lambda: metrics_beat_champ
+    trainer.evaluate_gauntlet = lambda: dummy_gauntlet(11.0, 1.0)
     trainer._evaluate_and_checkpoint()
     assert len(trainer.league) == 2
-    assert trainer.best_score == 8.0
+    assert trainer.best_score == 11.0

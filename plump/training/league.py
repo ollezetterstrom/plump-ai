@@ -11,10 +11,16 @@ import torch
 
 from ..models.transformer import PlumpTransformer
 
-# 0 = hand-written heuristic, 1 = uniform random, >= 2 = frozen champion.
-HEURISTIC = 0
-RANDOM = 1
-CHAMPION_BASE = 2
+# Bot policy IDs (0..=3 match plump_engine bot levels) and frozen champions (>= 4)
+ROOKIE = 0
+REGULAR = 1
+TACTICIAN = 2
+FINAL_BOSS = 3
+CHAMPION_BASE = 4
+
+# Aliases for backward compatibility
+HEURISTIC = TACTICIAN
+RANDOM = ROOKIE
 
 
 class League:
@@ -79,15 +85,26 @@ class League:
             )
 
     def sample_policy(self) -> int:
-        """Sample one of heuristic/random/champion for a league round."""
-        if not self.champions:
-            return HEURISTIC if self.rng.random() < 0.8 else RANDOM
+        """Sample one of Rookie/Regular/Tactician/FinalBoss/Champion for a league round."""
         roll = self.rng.random()
-        if roll < 0.70:
+        if self.champions:
+            if roll < 0.10:
+                return ROOKIE
+            if roll < 0.30:
+                return REGULAR
+            if roll < 0.60:
+                return TACTICIAN
+            if roll < 0.70:
+                return TACTICIAN
             return CHAMPION_BASE + self.rng.randrange(len(self.champions))
+        # No champions yet: redistribute the 30% champion share to Tactician (+20%) and Regular (+10%)
+        if roll < 0.10:
+            return ROOKIE
+        if roll < 0.40:
+            return REGULAR
         if roll < 0.90:
-            return HEURISTIC
-        return RANDOM
+            return TACTICIAN
+        return TACTICIAN
 
     def model_for(self, policy: int) -> Optional[PlumpTransformer]:
         if policy >= CHAMPION_BASE:

@@ -44,6 +44,7 @@ crates/
   plump-engine/
     src/
       augment.rs
+      bots.rs
       engine.rs
       lib.rs
       python.rs
@@ -69,16 +70,572 @@ tests/
   test_play_helpers.py
 .gitignore
 Cargo.toml
+inspect_game.py
 play.py
 prompt.txt
 pyproject.toml
 requirements.txt
 start_overnight.ps1
+stealth.py
 train.py
 </directory_structure>
 
 <files>
 This section contains the contents of the repository's files.
+
+<file path="crates/plump-engine/src/bots.rs">
+//! 4-tier hardcoded bot ladder:
+//! 0 = Rookie (random/low)
+//! 1 = Regular (basic card counter + follow/duck)
+//! 2 = Tactician (boss-card memory, finesse, high off-suit sloughing, exact forehead math)
+//! 3 = Final Boss (Tactician + parallel PIMC & exact MaxN endgame solver)
+
+use rand::seq::SliceRandom;
+
+use crate::engine::{rank_of, suit_bits, suit_of, FastEnv, Phase, FULL_DECK};
+use crate::search::{search_best_bid_pannplump, search_best_card};
+
+pub const BOT_ROOKIE: u8 = 0;
+pub const BOT_REGULAR: u8 = 1;
+pub const BOT_TACTICIAN: u8 = 2;
+pub const BOT_FINAL_BOSS: u8 = 3;
+
+#[inline]
+pub fn cards_from_mask(mask: u64) -> Vec<u8> {
+    let mut cards = Vec::with_capacity(mask.count_ones() as usize);
+    let mut m = mask;
+    while m != 0 {
+        cards.push(m.trailing_zeros() as u8);
+        m &= m - 1;
+    }
+    cards
+}
+
+#[inline]
+pub fn bids_from_mask(mask: u16) -> Vec<u8> {
+    let mut bids = Vec::with_capacity(mask.count_ones() as usize);
+    let mut m = mask;
+    while m != 0 {
+        bids.push(m.trailing_zeros() as u8);
+        m &= m - 1;
+    }
+    bids
+}
+
+#[inline]
+pub fn table_bits(env: &FastEnv) -> u64 {
+    let mut bits = 0u64;
+    for i in 0..env.table_len as usize {
+        bits |= 1u64 << env.table[i].1;
+    }
+    bits
+}
+
+#[inline]
+pub fn closest_legal_bid(mask: u16, target: f32) -> u8 {
+    let bids = bids_from_mask(mask);
+    *bids
+        .iter()
+        .min_by(|&&a, &&b| {
+            let da = (a as f32 - target).abs();
+            let db = (b as f32 - target).abs();
+            da.partial_cmp(&db).unwrap()
+        })
+        .unwrap_or(&0)
+}
+
+/// Select an action (bid in Bidding phase, card_idx in Playing phase) for `level`.
+pub fn bot_action(env: &FastEnv, level: u8) -> u8 {
+    match env.phase {
+        Phase::Bidding => match level {
+            BOT_ROOKIE => rookie_bid(env),
+            BOT_REGULAR => regular_bid(env),
+            BOT_TACTICIAN | BOT_FINAL_BOSS => tactician_bid(env),
+            _ => tactician_bid(env),
+        },
+        Phase::Playing => match level {
+            BOT_ROOKIE => rookie_card(env),
+            BOT_REGULAR => regular_card(env),
+            BOT_TACTICIAN => tactician_card(env),
+            BOT_FINAL_BOSS => final_boss_card(env),
+            _ => tactician_card(env),
+        },
+        Phase::Terminal => 0,
+    }
+}
+
+pub fn rookie_bid(env: &FastEnv) -> u8 {
+    let p = env.current_player as usize;
+    let mask = env.legal_bids_mask(p);
+    let bids = bids_from_mask(mask);
+    if bids.is_empty() {
+        return 0;
+    }
+    let cap = (env.round_cards / 3).max(1);
+    let mut rng = rand::thread_rng();
+    let low_bids: Vec<u8> = bids.iter().copied().filter(|&b| b <= cap).collect();
+    if !low_bids.is_empty() {
+        *low_bids.choose(&mut rng).unwrap()
+    } else {
+        *bids.choose(&mut rng).unwrap()
+    }
+}
+
+pub fn rookie_card(env: &FastEnv) -> u8 {
+    let p = env.current_player as usize;
+    let cards = cards_from_mask(env.legal_cards_mask(p));
+    let mut rng = rand::thread_rng();
+    *cards.choose(&mut rng).unwrap_or(&0)
+}
+
+pub fn regular_bid(env: &FastEnv) -> u8 {
+    let p = env.current_player as usize;
+    let mask = env.legal_bids_mask(p);
+    if mask == 0 {
+        return 0;
+    }
+    if env.round_cards == 1 {
+        let mut max_opp_rank = 0u8;
+        for i in 1..=3 {
+            let opp = (p + i) % 4;
+            let hand = env.hands[opp];
+            if hand != 0 {
+                max_opp_rank = max_opp_rank.max(rank_of(hand.trailing_zeros() as u8));
+            }
+        }
+        let target = if max_opp_rank < 12 { 1.0 } else { 0.0 };
+        return closest_legal_bid(mask, target);
+    }
+
+    let mut expected = 0.0f32;
+    let mut hand = env.hands[p];
+    while hand != 0 {
+        let c = hand.trailing_zeros() as u8;
+        hand &= hand - 1;
+        expected += match rank_of(c) {
+            14 => 0.85,
+            13 => 0.55,
+            12 => 0.25,
+            _ => 0.0,
+        };
+    }
+    closest_legal_bid(mask, expected)
+}
+
+pub fn regular_card(env: &FastEnv) -> u8 {
+    let p = env.current_player as usize;
+    let legal = env.legal_cards_mask(p);
+    let cards = cards_from_mask(legal);
+    if cards.len() <= 1 {
+        return *cards.first().unwrap_or(&0);
+    }
+    let bid = env.bids[p].max(0) as i32;
+    let tricks = env.tricks_won[p] as i32;
+
+    if env.table_len == 0 {
+        return if tricks < bid {
+            *cards.iter().max_by_key(|&&c| rank_of(c)).unwrap()
+        } else {
+            *cards.iter().min_by_key(|&&c| rank_of(c)).unwrap()
+        };
+    }
+
+    let led = env.led_suit;
+    let best = (0..env.table_len as usize)
+        .map(|i| env.table[i].1)
+        .filter(|&c| suit_of(c) == led)
+        .map(|c| c % 13)
+        .max()
+        .unwrap_or(0);
+
+    if tricks < bid {
+        let mut winners: Vec<u8> = cards
+            .iter()
+            .copied()
+            .filter(|&c| suit_of(c) == led && (c % 13) > best)
+            .collect();
+        if !winners.is_empty() {
+            winners.sort_by_key(|&c| c % 13);
+            *winners.last().unwrap()
+        } else {
+            *cards.iter().min_by_key(|&&c| rank_of(c)).unwrap()
+        }
+    } else {
+        let mut ducks: Vec<u8> = cards
+            .iter()
+            .copied()
+            .filter(|&c| suit_of(c) != led || (c % 13) < best)
+            .collect();
+        if !ducks.is_empty() {
+            ducks.sort_by_key(|&c| c % 13);
+            *ducks.last().unwrap()
+        } else {
+            *cards.iter().min_by_key(|&&c| rank_of(c)).unwrap()
+        }
+    }
+}
+
+pub fn tactician_bid(env: &FastEnv) -> u8 {
+    let p = env.current_player as usize;
+    let mask = env.legal_bids_mask(p);
+    if mask == 0 {
+        return 0;
+    }
+    if env.round_cards == 1 {
+        return search_best_bid_pannplump(env, p, 49);
+    }
+
+    let hand = env.hands[p];
+    let mut expected = 0.0f32;
+    for suit in 0..4u8 {
+        let s_cards = hand & suit_bits(suit);
+        let len = s_cards.count_ones();
+        let mut m = s_cards;
+        while m != 0 {
+            let c = m.trailing_zeros() as u8;
+            m &= m - 1;
+            expected += match rank_of(c) {
+                14 => 0.88,
+                13 => {
+                    if len >= 2 {
+                        0.68
+                    } else {
+                        0.38
+                    }
+                }
+                12 => {
+                    if len >= 3 {
+                        0.42
+                    } else if len == 2 {
+                        0.22
+                    } else {
+                        0.18
+                    }
+                }
+                11 => {
+                    if len >= 4 {
+                        0.20
+                    } else {
+                        0.0
+                    }
+                }
+                _ => 0.0,
+            };
+        }
+        if env.round_cards >= 6 && len >= 4 {
+            expected += 0.20 * (len - 3) as f32;
+        }
+    }
+
+    // Context adjustment based on bids already placed.
+    if env.bids_made > 0 {
+        let sum_so_far: i32 = (0..4)
+            .map(|q| env.bids[q])
+            .filter(|&b| b >= 0)
+            .map(|b| b as i32)
+            .sum();
+        let avg_expected_so_far =
+            (env.round_cards as f32) * (env.bids_made as f32 / 4.0);
+        if sum_so_far as f32 > avg_expected_so_far + 0.8 {
+            expected -= 0.18;
+        } else if (sum_so_far as f32) < avg_expected_so_far - 0.8 {
+            expected += 0.12;
+        }
+    }
+
+    closest_legal_bid(mask, expected.clamp(0.0, env.round_cards as f32))
+}
+
+#[inline]
+pub fn is_boss_card(card: u8, unseen: u64) -> bool {
+    let suit = suit_of(card);
+    let higher_in_suit = suit_bits(suit) & !((1u64 << (card + 1)) - 1);
+    (unseen & higher_in_suit) == 0
+}
+
+pub fn tactician_card(env: &FastEnv) -> u8 {
+    let p = env.current_player as usize;
+    let legal = env.legal_cards_mask(p);
+    let cards = cards_from_mask(legal);
+    if cards.len() <= 1 {
+        return *cards.first().unwrap_or(&0);
+    }
+
+    let unseen = FULL_DECK & !env.hands[p] & !env.played & !table_bits(env);
+    let bid = env.bids[p].max(0) as i32;
+    let tricks = env.tricks_won[p] as i32;
+    let need_tricks = tricks < bid;
+
+    // 1. Leading the trick
+    if env.table_len == 0 {
+        if need_tricks {
+            if let Some(&boss) = cards.iter().find(|&&c| is_boss_card(c, unseen)) {
+                return boss;
+            }
+            return *cards.iter().max_by_key(|&&c| rank_of(c)).unwrap();
+        } else {
+            // Ducking lead: prefer a non-boss low card.
+            if let Some(&safe_low) = cards
+                .iter()
+                .filter(|&&c| !is_boss_card(c, unseen))
+                .min_by_key(|&&c| rank_of(c))
+            {
+                return safe_low;
+            }
+            return *cards.iter().min_by_key(|&&c| rank_of(c)).unwrap();
+        }
+    }
+
+    // 2. Following in the trick
+    let led = env.led_suit;
+    let best = (0..env.table_len as usize)
+        .map(|i| env.table[i].1)
+        .filter(|&c| suit_of(c) == led)
+        .map(|c| c % 13)
+        .max()
+        .unwrap_or(0);
+
+    if need_tricks {
+        let mut winners: Vec<u8> = cards
+            .iter()
+            .copied()
+            .filter(|&c| suit_of(c) == led && (c % 13) > best)
+            .collect();
+        winners.sort_by_key(|&c| c % 13);
+
+        if !winners.is_empty() {
+            if env.table_len == 3 {
+                // 4th seat finesse: win with the cheapest card!
+                return winners[0];
+            }
+            if let Some(&boss) = winners.iter().find(|&&c| is_boss_card(c, unseen)) {
+                return boss;
+            }
+            return *winners.last().unwrap();
+        }
+        // Cannot beat the trick: dump lowest non-boss card.
+        return *cards
+            .iter()
+            .min_by_key(|&&c| (is_boss_card(c, unseen) as u8, rank_of(c)))
+            .unwrap();
+    } else {
+        // Trying to duck!
+        let off_suit: Vec<u8> = cards
+            .iter()
+            .copied()
+            .filter(|&c| suit_of(c) != led)
+            .collect();
+        if !off_suit.is_empty() {
+            // Void in led suit: slough our highest/most dangerous off-suit card!
+            return *off_suit
+                .iter()
+                .max_by_key(|&&c| (is_boss_card(c, unseen) as u8, rank_of(c)))
+                .unwrap();
+        }
+
+        let mut under: Vec<u8> = cards
+            .iter()
+            .copied()
+            .filter(|&c| (c % 13) < best)
+            .collect();
+        if !under.is_empty() {
+            under.sort_by_key(|&c| c % 13);
+            return *under.last().unwrap();
+        }
+
+        // Forced to overtake `best` in the led suit:
+        if env.table_len == 3 {
+            // Last to play: guaranteed to take this unwanted trick, so dump highest!
+            return *cards.iter().max_by_key(|&&c| rank_of(c)).unwrap();
+        }
+        // Otherwise play lowest above `best`, hoping the next player overtakes us.
+        *cards.iter().min_by_key(|&&c| rank_of(c)).unwrap()
+    }
+}
+
+pub fn final_boss_card(env: &FastEnv) -> u8 {
+    let p = env.current_player as usize;
+    let legal = env.legal_cards_mask(p);
+    if legal.count_ones() <= 1 {
+        return legal.trailing_zeros() as u8;
+    }
+    let remaining = env.round_cards.saturating_sub(env.current_trick);
+    if remaining <= 5 {
+        search_best_card(env, p, 12, None)
+    } else {
+        tactician_card(env)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::card_index;
+
+    #[test]
+    fn test_rookie_bot_action() {
+        let mut env = FastEnv::default();
+        let mut rng = rand::thread_rng();
+        env.new_round(5, 0, &mut rng);
+        let bid = bot_action(&env, BOT_ROOKIE);
+        assert!((env.legal_bids_mask(0) & (1u16 << bid)) != 0);
+
+        for _ in 0..4 {
+            let p = env.current_player as usize;
+            let b = rookie_bid(&env);
+            assert!((env.legal_bids_mask(p) & (1u16 << b)) != 0);
+            env.step_bid(b);
+        }
+
+        assert_eq!(env.phase, Phase::Playing);
+        let p = env.current_player as usize;
+        let card = bot_action(&env, BOT_ROOKIE);
+        assert!((env.legal_cards_mask(p) & (1u64 << card)) != 0);
+    }
+
+    #[test]
+    fn test_regular_forehead_bid() {
+        let mut env = FastEnv::default();
+        env.round_cards = 1;
+        env.start_bidder = 0;
+        env.current_player = 0;
+        env.phase = Phase::Bidding;
+        env.hands[0] = 1u64 << card_index(0, 10);
+        // Opponents hold 2H, 3H, 4H (ranks < 12)
+        env.hands[1] = 1u64 << card_index(0, 2);
+        env.hands[2] = 1u64 << card_index(0, 3);
+        env.hands[3] = 1u64 << card_index(0, 4);
+
+        let bid = regular_bid(&env);
+        assert_eq!(bid, 1);
+
+        // If one opponent holds Ace (rank 14 >= 12)
+        env.hands[1] = 1u64 << card_index(0, 14);
+        let bid_ace = regular_bid(&env);
+        assert_eq!(bid_ace, 0);
+    }
+
+    #[test]
+    fn test_tactician_finesse_and_slough() {
+        let mut env = FastEnv::default();
+        env.round_cards = 2;
+        env.bids = [1, 1, 0, 1];
+        env.phase = Phase::Playing;
+        env.current_player = 3;
+        env.table_len = 3;
+        env.led_suit = 0; // hearts
+        env.table[0] = (0, card_index(0, 5));
+        env.table[1] = (1, card_index(0, 9));
+        env.table[2] = (2, card_index(0, 7));
+        // Seat 3 needs a trick (bid 1, won 0).
+        // Best rank so far is 9 (card_index(0, 9)).
+        // Seat 3 holds 10 of hearts (rank 10) and Ace of hearts (rank 14).
+        // In 4th seat, tactician finesses with cheapest winning card: 10 of hearts!
+        env.hands[3] = (1u64 << card_index(0, 10)) | (1u64 << card_index(0, 14));
+        let card = tactician_card(&env);
+        assert_eq!(card, card_index(0, 10));
+
+        // Now test sloughing: seat 3 has already made their bid (bid 0, won 0).
+        // Seat 3 is void in hearts, holds Spades 2 and Spades Ace.
+        // Trying to duck, void in led suit -> sloughs dangerous high card (Spades Ace).
+        env.bids[3] = 0;
+        env.hands[3] = (1u64 << card_index(1, 2)) | (1u64 << card_index(1, 14));
+        let slough_card = tactician_card(&env);
+        assert_eq!(slough_card, card_index(1, 14));
+    }
+
+    #[test]
+    fn test_is_boss_card() {
+        let unseen = (1u64 << card_index(0, 10)) | (1u64 << card_index(0, 5));
+        // Ace (rank 14) is boss card: no higher unseen
+        assert!(is_boss_card(card_index(0, 14), unseen));
+        // Jack (rank 11) is boss card: no higher unseen
+        assert!(is_boss_card(card_index(0, 11), unseen));
+        // 9 is NOT boss card: 10 is unseen
+        assert!(!is_boss_card(card_index(0, 9), unseen));
+    }
+}
+</file>
+
+<file path="inspect_game.py">
+import torch
+import plump_engine
+import play
+from plump.config import BEST_CHECKPOINT, LATEST_CHECKPOINT, ROUND_SCHEDULE
+from plump.checkpoint import load_model
+
+SUIT_NAMES = ("H", "S", "D", "C")
+RANK_NAMES = {2:"2", 3:"3", 4:"4", 5:"5", 6:"6", 7:"7", 8:"8", 9:"9", 10:"10", 11:"J", 12:"Q", 13:"K", 14:"A"}
+
+def fmt_card(c: int) -> str:
+    return f"{SUIT_NAMES[c // 13]}{RANK_NAMES[c % 13 + 2]}"
+
+def fmt_hand(cards) -> str:
+    sorted_cards = sorted(cards, key=lambda c: (c // 13, -(c % 13)))
+    return " ".join(fmt_card(c) for c in sorted_cards)
+
+def main():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    ckpt = BEST_CHECKPOINT if BEST_CHECKPOINT.exists() else LATEST_CHECKPOINT
+    model, meta = load_model(ckpt, device)
+    print(f"=== AI SELF-PLAY LOG ({ckpt.name}, rounds_seen={meta.get('rounds_seen')}, best_score={meta.get('best_score'):.3f}) ===")
+
+    settings = play.PlaySettings(autoplay=True, use_search=True, worlds=32, model_available=True)
+    env = plump_engine.PyFastEnv(seed=2026)
+    totals = [0, 0, 0, 0]
+    plumps = [0, 0, 0, 0]
+
+    for r_idx, round_cards in enumerate(ROUND_SCHEDULE):
+        start_bidder = r_idx % 4
+        dealer = (start_bidder + 3) % 4
+        env.new_round(round_cards, start_bidder)
+        st = env.state()
+
+        print(f"\n--- ROUND {r_idx+1:02d}/20 ({round_cards} cards | Dealer: P{dealer} | First Bidder: P{start_bidder}) ---")
+        for p in range(4):
+            print(f"  P{p} Hand: [{fmt_hand(st['hands'][p])}]")
+
+        bid_logs = []
+        while env.phase == "Bidding":
+            p = int(env.current_player)
+            forb = env.forbidden_bid()
+            bid, dec = play.choose_bid(env, model, settings, device)
+            env.step_bid(bid)
+            forb_str = f" (forb={forb})" if forb is not None else ""
+            bid_logs.append(f"P{p}:{bid}{forb_str} [{dec.extra}]")
+        leader = int(env.get_leader())
+        print(f"  Bids: " + " -> ".join(bid_logs) + f" | Leader: P{leader} (bid {env.bids[leader]})")
+
+        while env.phase == "Playing":
+            t_num = int(env.state()["current_trick"]) + 1
+            trick_plays = []
+            winner = None
+            while winner is None and env.phase == "Playing":
+                p = int(env.current_player)
+                card, dec = play.choose_card(env, model, settings, device)
+                winner = env.step_play(card)
+                trick_plays.append(f"P{p}:{fmt_card(card)}")
+            print(f"  T{t_num:02d}: " + " -> ".join(trick_plays) + f"  => P{winner} wins")
+
+        pts = [int(env.display_points_for(p)) for p in range(4)]
+        res_logs = []
+        for p in range(4):
+            b = int(env.bids[p])
+            w = int(env.tricks_won[p])
+            if w != b:
+                plumps[p] += 1
+            totals[p] += pts[p]
+            status = "OK" if w == b else "PLUMP"
+            res_logs.append(f"P{p}: {w}/{b} ({status}, +{pts[p]} -> {totals[p]})")
+        print("  Result: " + " | ".join(res_logs))
+
+    print("\n=== FINAL SCOREBOARD ===")
+    for p in range(4):
+        print(f"  P{p}: {totals[p]} pts ({plumps[p]} plumps)")
+
+if __name__ == "__main__":
+    main()
+</file>
 
 <file path="crates/plump-engine/src/augment.rs">
 //! 24x suit-isomorphism augmentation.
@@ -547,6 +1104,11 @@ impl PyFastEnv {
         }))
     }
 
+    fn bot_action(&self, py: Python<'_>, level: u8) -> u8 {
+        let env = self.env;
+        py.allow_threads(move || crate::bots::bot_action(&env, level))
+    }
+
     fn state(&self, py: Python<'_>) -> PyResult<PyObject> {
         let dict = PyDict::new_bound(py);
         let hands: Vec<Vec<u8>> = self.env.hands.iter().map(|&m| cards_in(m)).collect();
@@ -755,6 +1317,28 @@ impl PyRustVecEnv {
 
         Ok(dict.into())
     }
+
+    fn bot_actions<'py>(
+        &self,
+        py: Python<'py>,
+        levels: Bound<'py, PyAny>,
+    ) -> PyResult<Py<PyArray1<u8>>> {
+        let levs: Vec<u8> = if let Ok(arr) = levels.extract::<PyReadonlyArray1<u8>>() {
+            arr.as_slice()?.to_vec()
+        } else if let Ok(arr64) = levels.extract::<PyReadonlyArray1<i64>>() {
+            arr64.as_slice()?.iter().map(|&x| x as u8).collect()
+        } else if let Ok(v) = levels.extract::<Vec<u8>>() {
+            v
+        } else if let Ok(single) = levels.extract::<u8>() {
+            vec![single]
+        } else {
+            return Err(PyValueError::new_err(
+                "expected list of ints or 1D numpy array for levels",
+            ));
+        };
+        let actions = py.allow_threads(|| self.inner.bot_actions(&levs));
+        Ok(actions.into_pyarray_bound(py).unbind())
+    }
 }
 
 /// Apply independent random suit permutations to a sampled batch.
@@ -836,6 +1420,10 @@ fn plump_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(augment_batch_numpy, m)?)?;
     m.add_function(wrap_pyfunction!(terminal_reward_py, m)?)?;
     m.add_function(wrap_pyfunction!(display_points_py, m)?)?;
+    m.add("BOT_ROOKIE", crate::bots::BOT_ROOKIE)?;
+    m.add("BOT_REGULAR", crate::bots::BOT_REGULAR)?;
+    m.add("BOT_TACTICIAN", crate::bots::BOT_TACTICIAN)?;
+    m.add("BOT_FINAL_BOSS", crate::bots::BOT_FINAL_BOSS)?;
     Ok(())
 }
 </file>
@@ -911,6 +1499,7 @@ struct PendingTransition {
     action: u8,
     player: u8,
     is_play: bool,
+    #[allow(dead_code)]
     trick: u8,
 }
 
@@ -1010,6 +1599,29 @@ impl RustVecEnv {
         obs
     }
 
+    /// Compute bot actions for each environment according to the requested bot levels.
+    /// If `levels.len() == 1`, that level is applied across all environments.
+    pub fn bot_actions(&self, levels: &[u8]) -> Vec<u8> {
+        if levels.len() == 1 {
+            let level = levels[0];
+            self.envs
+                .par_iter()
+                .map(|env| crate::bots::bot_action(env, level))
+                .collect()
+        } else {
+            assert_eq!(
+                levels.len(),
+                self.envs.len(),
+                "levels length must match envs length or be 1"
+            );
+            self.envs
+                .par_iter()
+                .zip(levels.par_iter())
+                .map(|(env, &level)| crate::bots::bot_action(env, level))
+                .collect()
+        }
+    }
+
     fn reset_env(&mut self, i: usize) {
         self.schedule_pos[i] = (self.schedule_pos[i] + 1) % ROUND_SCHEDULE.len();
         let next_start = (self.envs[i].start_bidder + 1) % 4;
@@ -1087,52 +1699,13 @@ impl RustVecEnv {
     /// and drain the pending transitions.
     fn finalize_env(&mut self, i: usize) -> (Vec<Transition>, RoundSummary) {
         let env = self.envs[i];
-        let round_cards = env.round_cards as usize;
-        let winners = env.trick_winners();
-
-        // Per-trick shaped reward for every player, using cumulative tricks.
-        let mut shaped = vec![[0.0f32; 4]; round_cards];
-        let mut cumulative = [0u8; 4];
-        for t in 0..round_cards {
-            if let Some(&w) = winners.get(t) {
-                cumulative[w] += 1;
-            }
-            for p in 0..4 {
-                let bid = env.bids[p].max(0) as i32;
-                let won = winners.get(t).copied() == Some(p);
-                let count = cumulative[p] as i32;
-                shaped[t][p] = if won {
-                    if count <= bid {
-                        1.0
-                    } else {
-                        -1.5
-                    }
-                } else if count < bid {
-                    -1.0
-                } else {
-                    0.5
-                };
-            }
-        }
-        let mut suffix = vec![[0.0f32; 4]; round_cards + 1];
-        for t in (0..round_cards).rev() {
-            for p in 0..4 {
-                suffix[t][p] = suffix[t + 1][p] + shaped[t][p];
-            }
-        }
-
         let terminal: [f32; 4] =
             std::array::from_fn(|p| terminal_reward(env.tricks_won[p], env.bids[p]));
 
         let mut transitions = Vec::with_capacity(self.pending[i].len());
         for rec in self.pending[i].drain(..) {
             let p = rec.player as usize;
-            let ret = if rec.is_play {
-                let t = (rec.trick as usize).min(round_cards);
-                terminal[p] + 0.20 * suffix[t][p]
-            } else {
-                terminal[p]
-            };
+            let ret = terminal[p];
             transitions.push(Transition {
                 toks: rec.toks,
                 feats: rec.feats,
@@ -1272,33 +1845,10 @@ mod tests {
 
         let (transitions, summary) = vec.finalize_env(0);
         assert_eq!(transitions.len(), 8);
-        let winner = round.trick_winners()[0];
         for t in &transitions {
             let p = t.player as usize;
             let terminal = summary.rewards[p];
-            if t.is_play {
-                let shaped = if p == winner {
-                    // Bid 0/1 matters: the bid in this test is the lowest
-                    // legal one, which is 0 for the first three bidders.
-                    let after = 1i32;
-                    let bid = round.bids[p].max(0) as i32;
-                    if after <= bid {
-                        1.0
-                    } else {
-                        -1.5
-                    }
-                } else {
-                    let bid = round.bids[p].max(0) as i32;
-                    if 0 < bid {
-                        -1.0
-                    } else {
-                        0.5
-                    }
-                };
-                assert!((t.ret - (terminal + 0.20 * shaped)).abs() < 1e-6);
-            } else {
-                assert!((t.ret - terminal).abs() < 1e-6);
-            }
+            assert!((t.ret - terminal).abs() < 1e-6);
         }
     }
 }
@@ -1430,9 +1980,51 @@ from ..checkpoint import load_checkpoint, save_checkpoint
 from ..config import BID_BASE, PlumpTransformerConfig, TrainConfig
 from ..models.transformer import PlumpTransformer
 from .buffer import RingBuffer
-from .league import League
+from .league import CHAMPION_BASE, FINAL_BOSS, REGULAR, ROOKIE, TACTICIAN, League
 
 COMBO_MASKS = ((0, 1), (2, 3), (0, 2), (1, 3), (0, 3), (1, 2))
+
+
+def format_gauntlet_ladder(results: Dict[str, Dict[str, float]], round_num: int) -> str:
+    boss_info = [
+        ("Rookie", "Lv.1 Rookie"),
+        ("Regular", "Lv.2 Regular"),
+        ("Tactician", "Lv.3 Tactician"),
+        ("Final Boss", "Lv.4 Final Boss"),
+    ]
+    statuses = []
+    fighting_found = False
+    for name, _ in boss_info:
+        data = results.get(name, {})
+        margin = data.get("margin", 0.0)
+        if not fighting_found:
+            if margin > 0.0:
+                statuses.append("[✓ DEFEATED]")
+            else:
+                statuses.append("[⚔ FIGHTING]")
+                fighting_found = True
+        else:
+            statuses.append("[🔒 LOCKED  ]")
+
+    title = f" BOSS GAUNTLET (Round {round_num:,}) "
+    inner_width = 78
+    dashes = max(0, inner_width - len(title))
+    left_dashes = dashes // 2
+    right_dashes = dashes - left_dashes
+    top = "╭" + "─" * left_dashes + title + "─" * right_dashes + "╮"
+    bot = "╰" + "─" * inner_width + "╯"
+
+    lines = [top]
+    for (name, label), status in zip(boss_info, statuses):
+        data = results.get(name, {})
+        ai_pts = data.get("ai_avg_points", 0.0)
+        bot_pts = data.get("bot_avg_points", 0.0)
+        margin = data.get("margin", 0.0)
+        content = f"  {status} {label:<16} AI: {ai_pts:5.2f} pts | Bot: {bot_pts:5.2f} pts | Margin: {margin:+5.2f}"
+        pad = inner_width - len(content)
+        lines.append("│" + content + " " * max(0, pad) + "│")
+    lines.append(bot)
+    return "\n".join(lines)
 
 
 class PlumpTrainer:
@@ -1476,6 +2068,7 @@ class PlumpTrainer:
         self.grad_steps = int(payload.get("grad_steps", 0)) if payload else 0
         self.best_score = float(payload.get("best_score", -math.inf)) if payload else -math.inf
         self.last_eval_metrics: Optional[Dict] = None
+        self.last_gauntlet: Optional[Dict[str, Dict[str, float]]] = None
         self.last_train_metrics: Dict[str, float] = {}
         self.env_steps = 0
         self.train_calls = 0
@@ -1539,9 +2132,10 @@ class PlumpTrainer:
         legal_rows = legal[indices][:, :n_actions].astype(np.bool_)
         if not explore:
             return masked_argmax(q, legal_rows).astype(np.uint8)
-        eps = np.linspace(
-            self.cfg.epsilon_min, self.cfg.epsilon_max, self.cfg.num_envs
-        )[indices]
+        if bidding:
+            eps = np.linspace(0.02, 0.20, self.cfg.num_envs)[indices]
+        else:
+            eps = np.linspace(0.005, 0.03, self.cfg.num_envs)[indices]
         return epsilon_greedy(q, legal_rows, eps, self.rng_np)
 
     def _random_actions(
@@ -1595,24 +2189,28 @@ class PlumpTrainer:
             opponent_idx = phase_idx[~controlled[phase_idx]]
             if len(opponent_idx):
                 policies = self.opp_policy[opponent_idx]
-                for policy in np.unique(policies):
-                    group = opponent_idx[policies == policy]
-                    if policy >= 2:
+                # Fast vectorised Rust bots for policies 0..=3 (ROOKIE, REGULAR, TACTICIAN, FINAL_BOSS)
+                bot_mask = (policies >= 0) & (policies < CHAMPION_BASE)
+                if bot_mask.any():
+                    bot_group = opponent_idx[bot_mask]
+                    bot_levels = np.zeros(n, dtype=np.uint8)
+                    bot_levels[bot_group] = policies[bot_mask].astype(np.uint8)
+                    bot_acts = np.asarray(self.vec_env.bot_actions(bot_levels))
+                    actions[bot_group] = bot_acts[bot_group]
+                # Frozen champion models for policies >= CHAMPION_BASE
+                champ_mask = policies >= CHAMPION_BASE
+                if champ_mask.any():
+                    for policy in np.unique(policies[champ_mask]):
+                        group = opponent_idx[policies == policy]
                         champion = self.league.model_for(int(policy))
                         if champion is not None:
                             actions[group] = self._model_actions(
                                 champion, toks, feats, legal, group, bidding, False
                             )
                         else:
-                            actions[group] = self._heuristic_actions(
-                                toks, feats, legal, group, bidding
-                            )
-                    elif policy == 1:
-                        actions[group] = self._random_actions(legal, group, bidding)
-                    else:
-                        actions[group] = self._heuristic_actions(
-                            toks, feats, legal, group, bidding
-                        )
+                            bot_levels = np.full(n, TACTICIAN, dtype=np.uint8)
+                            bot_acts = np.asarray(self.vec_env.bot_actions(bot_levels))
+                            actions[group] = bot_acts[group]
         return actions
 
     def _ingest(self, out: dict) -> None:
@@ -1649,9 +2247,8 @@ class PlumpTrainer:
             return None
 
         self.train_calls += 1
-        # Rounds produce many more play decisions than bid decisions, so the
-        # bid replay sample is refreshed only on every fourth optimizer step.
-        use_bid = self.train_calls % 4 == 0 and len(self.bid_buffer) >= batch
+        # Train bidder on every step as soon as buffer is ready.
+        use_bid = len(self.bid_buffer) >= batch
         phases: list[tuple[str, RingBuffer]] = [("play", self.play_buffer)]
         if use_bid:
             phases.append(("bid", self.bid_buffer))
@@ -1714,7 +2311,7 @@ class PlumpTrainer:
         self.last_train_metrics = metrics
         return metrics
 
-    def _eval_actions(self, obs, learner_seat: int) -> np.ndarray:
+    def _eval_actions(self, obs, learner_seat: int, vec=None) -> np.ndarray:
         toks, feats, legal, is_bid, players = obs
         n = len(toks)
         actions = np.zeros(n, dtype=np.uint8)
@@ -1732,9 +2329,15 @@ class PlumpTrainer:
             if len(opponent_idx):
                 champion = self.league.champion()
                 if champion is None:
-                    actions[opponent_idx] = self._heuristic_actions(
-                        toks, feats, legal, opponent_idx, bidding
-                    )
+                    if vec is not None:
+                        bot_acts = np.asarray(
+                            vec.bot_actions(np.full(n, TACTICIAN, dtype=np.uint8))
+                        )
+                        actions[opponent_idx] = bot_acts[opponent_idx]
+                    else:
+                        actions[opponent_idx] = self._heuristic_actions(
+                            toks, feats, legal, opponent_idx, bidding
+                        )
                 else:
                     actions[opponent_idx] = self._model_actions(
                         champion, toks, feats, legal, opponent_idx, bidding, False
@@ -1761,7 +2364,7 @@ class PlumpTrainer:
             seat_tricks = 0
             while seat_rounds < target:
                 obs = vec.observe_batch()
-                actions = self._eval_actions(obs, seat)
+                actions = self._eval_actions(obs, seat, vec=vec)
                 out = vec.step_batch(actions.tolist())
                 summaries = out["summaries"]
                 for j in range(len(summaries["env_indices"])):
@@ -1811,6 +2414,99 @@ class PlumpTrainer:
         self.last_eval_metrics = metrics
         return metrics
 
+    def _evaluate_against_bot(
+        self, bot_level: int, rounds_per_seat: int = 20, num_envs: int = 20
+    ) -> Dict[str, float]:
+        self.model.eval()
+        total_points = 0.0
+        total_opp_points = 0.0
+        total_rounds = 0
+        total_made = 0
+        total_tricks = 0
+
+        # 20 envs = all 20 rounds of a real Plump game (10..1, 1..10)
+        num_envs = 20
+
+        for seat in range(4):
+            vec = plump_engine.PyRustVecEnv(
+                num_envs, seed=self.cfg.seed + 1000 + bot_level * 100 + seat * 17
+            )
+            finished_envs = set()
+            while len(finished_envs) < num_envs:
+                obs = vec.observe_batch()
+                toks, feats, legal, is_bid, players = obs
+                n = len(toks)
+                actions = np.zeros(n, dtype=np.uint8)
+                controlled = np.asarray(players) == seat
+
+                for bidding in (True, False):
+                    phase_idx = np.flatnonzero(np.asarray(is_bid, dtype=np.bool_) == bidding)
+                    if len(phase_idx) == 0:
+                        continue
+                    learner_idx = phase_idx[controlled[phase_idx]]
+                    if len(learner_idx):
+                        actions[learner_idx] = self._model_actions(
+                            self.model, toks, feats, legal, learner_idx, bidding, False
+                        )
+
+                opp_idx = np.flatnonzero(~controlled)
+                if len(opp_idx):
+                    bot_acts = np.asarray(
+                        vec.bot_actions(np.full(n, bot_level, dtype=np.uint8))
+                    )
+                    actions[opp_idx] = bot_acts[opp_idx]
+
+                out = vec.step_batch(actions.tolist())
+                summaries = out["summaries"]
+                for j, env_idx in enumerate(summaries["env_indices"]):
+                    env_idx = int(env_idx)
+                    # Only count the FIRST round finished by each of the 20 tables
+                    if env_idx in finished_envs:
+                        continue
+                    finished_envs.add(env_idx)
+                    bid = int(summaries["bids"][j, seat])
+                    tricks = int(summaries["tricks_won"][j, seat])
+                    points = float(summaries["points"][j, seat])
+                    opp_pts = float(
+                        (summaries["points"][j].sum() - summaries["points"][j, seat])
+                        / 3.0
+                    )
+                    total_points += points
+                    total_opp_points += opp_pts
+                    total_tricks += tricks
+                    total_made += int(tricks == bid)
+                    total_rounds += 1
+            del vec
+
+        avg_score = total_points / max(1, total_rounds)
+        opp_avg_score = total_opp_points / max(1, total_rounds)
+        margin = avg_score - opp_avg_score
+        made_rate = total_made / max(1, total_rounds)
+        avg_tricks = total_tricks / max(1, total_rounds)
+
+        return {
+            "ai_avg_points": avg_score,
+            "bot_avg_points": opp_avg_score,
+            "margin": margin,
+            "made_rate": made_rate,
+            "avg_tricks": avg_tricks,
+            "rounds": total_rounds,
+        }
+
+    def evaluate_gauntlet(
+        self, rounds_per_seat: int = 8
+    ) -> Dict[str, Dict[str, float]]:
+        bosses = [
+            ("Rookie", ROOKIE),
+            ("Regular", REGULAR),
+            ("Tactician", TACTICIAN),
+            ("Final Boss", FINAL_BOSS),
+        ]
+        results = {}
+        for name, level in bosses:
+            results[name] = self._evaluate_against_bot(level, rounds_per_seat=rounds_per_seat)
+        return results
+
     def save(self, best: bool = False) -> None:
         path = self.cfg.best_path if best else self.cfg.latest_path
         save_checkpoint(
@@ -1855,29 +2551,41 @@ class PlumpTrainer:
                 "seat {seat}: score={avg_points:.3f} opp={opp_avg_points:.3f} margin={margin:+.3f} "
                 "made={made_rate:.3f} tricks={avg_tricks:.2f}".format(**seat)
             )
+        if self.last_gauntlet:
+            lines.append("")
+            lines.append(format_gauntlet_ladder(self.last_gauntlet, self.rounds_seen))
+            for name, d in self.last_gauntlet.items():
+                lines.append(
+                    f"gauntlet_{name.lower().replace(' ', '_')}: ai={d['ai_avg_points']:.2f} "
+                    f"bot={d['bot_avg_points']:.2f} margin={d['margin']:+.2f} made={d['made_rate']:.1%}"
+                )
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     def _evaluate_and_checkpoint(self) -> Dict:
         was_training = self.model.training
         metrics = self.evaluate()
+        gauntlet = self.evaluate_gauntlet()
+        self.last_gauntlet = gauntlet
         self.model.train(was_training)
 
-        has_champion = self.league.champion() is not None
-        if has_champion:
-            improved = metrics["margin"] > 0.05
-        else:
-            improved = metrics["avg_score"] > self.best_score
-
+        gauntlet_score = sum(d["ai_avg_points"] for d in gauntlet.values()) / len(gauntlet)
+        gauntlet_margin = sum(d["margin"] for d in gauntlet.values()) / len(gauntlet)
         added = False
+        if metrics["margin"] > 0.05 or len(self.league) == 0:
+            added = bool(self.league.add_champion(self.model, gauntlet_score))
+
+        improved = (gauntlet_score > self.best_score) and (gauntlet_margin > 0.0)
         if improved:
-            self.best_score = metrics["avg_score"]
-            added = self.league.add_champion(self.model, metrics["avg_score"])
+            self.best_score = gauntlet_score
             self.save(best=True)
         elif not self.cfg.best_path.exists():
             self.save(best=True)
 
         self.save(best=False)
         self.write_session()
+
+        ladder_str = format_gauntlet_ladder(gauntlet, self.rounds_seen)
+        print("\n" + ladder_str, flush=True)
 
         elapsed = max(1e-9, time.time() - self._start_time)
         tm = self.last_train_metrics or {}
@@ -2169,17 +2877,17 @@ class TrainConfig:
     weight_decay: float = 1e-4
     replay_play: int = 250_000
     replay_bid: int = 100_000
-    eval_every: int = 5_000
+    eval_every: int = 10_000
     eval_rounds: int = 400
     eval_envs: int = 20
     eval_batch_rounds: int = 100
     league_fraction: float = 0.5
     max_champions: int = 5
-    epsilon_min: float = 0.02
-    epsilon_max: float = 0.25
+    epsilon_min: float = 0.01
+    epsilon_max: float = 0.05
     belief_loss_weight: float = 0.15
     tricks_loss_weight: float = 0.10
-    shaping_weight: float = 0.20
+    shaping_weight: float = 0.0
     grad_clip: float = 1.0
     checkpoint_every_evals: int = 1
     use_amp: bool = True
@@ -2304,7 +3012,14 @@ def test_head_to_head_margin_evaluation_and_league_promotion(tmp_path):
         "made_rate": 0.5,
         "avg_tricks": 2.0,
     }
+    dummy_gauntlet = lambda score=10.0, margin=5.0: {
+        "Rookie": {"ai_avg_points": score, "bot_avg_points": score - margin, "margin": margin, "made_rate": 0.5, "avg_tricks": 2.0, "rounds": 8},
+        "Regular": {"ai_avg_points": score, "bot_avg_points": score - margin, "margin": margin, "made_rate": 0.5, "avg_tricks": 2.0, "rounds": 8},
+        "Tactician": {"ai_avg_points": score, "bot_avg_points": score - margin, "margin": margin, "made_rate": 0.5, "avg_tricks": 2.0, "rounds": 8},
+        "Final Boss": {"ai_avg_points": score, "bot_avg_points": score - margin, "margin": margin, "made_rate": 0.5, "avg_tricks": 2.0, "rounds": 8},
+    }
     trainer.evaluate = lambda: metrics_win
+    trainer.evaluate_gauntlet = lambda: dummy_gauntlet(10.0, 5.0)
     trainer._evaluate_and_checkpoint()
     assert len(trainer.league) == 1
     assert trainer.best_score == 10.0
@@ -2318,6 +3033,7 @@ def test_head_to_head_margin_evaluation_and_league_promotion(tmp_path):
         "avg_tricks": 2.0,
     }
     trainer.evaluate = lambda: metrics_tie
+    trainer.evaluate_gauntlet = lambda: dummy_gauntlet(12.0, 0.0)
     trainer._evaluate_and_checkpoint()
     assert len(trainer.league) == 1  # Not promoted!
 
@@ -2334,9 +3050,10 @@ def test_head_to_head_margin_evaluation_and_league_promotion(tmp_path):
         for p in trainer.model.parameters():
             p.add_(torch.randn_like(p) * 0.01)
     trainer.evaluate = lambda: metrics_beat_champ
+    trainer.evaluate_gauntlet = lambda: dummy_gauntlet(11.0, 1.0)
     trainer._evaluate_and_checkpoint()
     assert len(trainer.league) == 2
-    assert trainer.best_score == 8.0
+    assert trainer.best_score == 11.0
 </file>
 
 <file path="tests/test_model.py">
@@ -3053,6 +3770,621 @@ module-name = "plump_engine"
 pythonpath = ["."]
 testpaths = ["tests"]
 addopts = "-q"
+</file>
+
+<file path="stealth.py">
+"""
+stealth.py — Windows 11 Bedroom Stealth Controller for Overnight AI Training.
+Automatically requests Administrator privileges so OpenRGB + PawnIO can turn off
+internal motherboard, case fan, RAM, and GPU RGB lights.
+
+Run GUI:  python stealth.py
+Run CLI:  python stealth.py --now
+"""
+
+from __future__ import annotations
+
+import argparse
+import atexit
+import ctypes
+from ctypes import wintypes
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import tkinter as tk
+import winreg
+
+# ── Auto-Elevate to Administrator (Required for PawnIO / Internal PC RGB) ────
+def ensure_admin() -> None:
+    try:
+        is_admin = ctypes.windll.shell32.IsUserAnAdmin() != 0
+    except Exception:
+        is_admin = False
+    if not is_admin:
+        script = str(Path(__file__).resolve())
+        args = " ".join([f'"{script}"'] + [f'"{a}"' for a in sys.argv[1:]])
+        ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", sys.executable, args, str(Path(__file__).resolve().parent), 1
+        )
+        sys.exit(0)
+
+
+# ── Win32 API Constants & 64-bit Signatures ──────────────────────────────────
+ES_CONTINUOUS = 0x80000000
+ES_SYSTEM_REQUIRED = 0x00000001
+
+HWND_BROADCAST = 0xFFFF
+WM_SYSCOMMAND = 0x0112
+SC_MONITORPOWER = 0xF170
+MONITOR_OFF = 2
+MONITOR_ON = -1
+
+VK_VOLUME_MUTE = 0xAD
+VK_SPACE = 0x20
+VK_RETURN = 0x0D
+VK_ESCAPE = 0x1B
+KEYEVENTF_KEYUP = 0x0002
+
+IDLE_PRIORITY_CLASS = 0x00000040
+NORMAL_PRIORITY_CLASS = 0x00000020
+PROCESS_ALL_ACCESS = 0x1F0FFF
+CREATE_NO_WINDOW = 0x08000000
+DETACHED_PROCESS = 0x00000008
+
+GUID_SUB_PROCESSOR = "54533251-82be-4824-96c1-47b60b740d00"
+GUID_PROCTHROTTLEMAX = "bc5038f7-23e0-4960-96da-33abaf5935ec"
+GUID_PERFBOOSTMODE = "be337238-0d82-4146-a960-4f3749d470c7"
+GUID_COOLINGPOLICY = "94d3a615-a899-4ac5-ae2b-e4d8f634367f"
+
+DWORD_PTR = ctypes.c_size_t
+
+user32 = ctypes.windll.user32
+kernel32 = ctypes.windll.kernel32
+ntdll = ctypes.windll.ntdll
+
+kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+kernel32.OpenProcess.restype = wintypes.HANDLE
+
+kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+kernel32.CloseHandle.restype = wintypes.BOOL
+
+kernel32.SetPriorityClass.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+kernel32.SetPriorityClass.restype = wintypes.BOOL
+
+kernel32.SetProcessAffinityMask.argtypes = [wintypes.HANDLE, DWORD_PTR]
+kernel32.SetProcessAffinityMask.restype = wintypes.BOOL
+
+kernel32.GetProcessAffinityMask.argtypes = [
+    wintypes.HANDLE,
+    ctypes.POINTER(DWORD_PTR),
+    ctypes.POINTER(DWORD_PTR),
+]
+kernel32.GetProcessAffinityMask.restype = wintypes.BOOL
+
+kernel32.SetThreadExecutionState.argtypes = [wintypes.DWORD]
+kernel32.SetThreadExecutionState.restype = wintypes.DWORD
+
+ntdll.NtSuspendProcess.argtypes = [wintypes.HANDLE]
+ntdll.NtSuspendProcess.restype = wintypes.LONG
+
+ntdll.NtResumeProcess.argtypes = [wintypes.HANDLE]
+ntdll.NtResumeProcess.restype = wintypes.LONG
+
+
+class POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
+def get_cursor_pos() -> tuple[int, int]:
+    pt = POINT()
+    user32.GetCursorPos(ctypes.byref(pt))
+    return pt.x, pt.y
+
+
+def wake_key_pressed() -> bool:
+    for vk in (VK_SPACE, VK_RETURN, VK_ESCAPE):
+        if user32.GetAsyncKeyState(vk) & 0x8000:
+            return True
+    return False
+
+
+def toggle_system_mute() -> None:
+    user32.keybd_event(VK_VOLUME_MUTE, 0, 0, 0)
+    user32.keybd_event(VK_VOLUME_MUTE, 0, KEYEVENTF_KEYUP, 0)
+
+
+def set_monitors_power(turn_off: bool) -> None:
+    mode = MONITOR_OFF if turn_off else MONITOR_ON
+    user32.SendMessageW(HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER, mode)
+    if not turn_off:
+        x, y = get_cursor_pos()
+        user32.SetCursorPos(x + 1, y)
+        user32.SetCursorPos(x, y)
+
+
+def run_hidden(cmd: list[str]) -> None:
+    subprocess.run(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=CREATE_NO_WINDOW | DETACHED_PROCESS,
+        check=False,
+    )
+
+
+def find_openrgb() -> str | None:
+    in_path = shutil.which("OpenRGB") or shutil.which("OpenRGB.exe")
+    if in_path:
+        return in_path
+    candidates = [
+        Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "OpenRGB" / "OpenRGB.exe",
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "OpenRGB" / "OpenRGB.exe",
+        Path("C:/Program Files (x86)/OpenRGB/OpenRGB.exe"),
+    ]
+    for p in candidates:
+        if p.exists():
+            return str(p)
+    return None
+
+
+def is_pawnio_installed() -> bool:
+    res = subprocess.run(
+        ["sc", "query", "PawnIO"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=CREATE_NO_WINDOW,
+        check=False,
+    )
+    return res.returncode == 0
+
+
+class StealthController:
+    def __init__(self) -> None:
+        self.active = False
+        self.muted_by_us = False
+        self.saved_lighting: dict[str, int] = {}
+        self.train_proc: subprocess.Popen | None = None
+        self.log_handle = None
+        self.pacer_stop = threading.Event()
+        self.pacer_thread: threading.Thread | None = None
+        self.gpu_quiet_duty = 0.55
+        atexit.register(self.disable_stealth)
+
+    def apply_quiet_cpu(self, max_cpu_pct: int = 80) -> None:
+        run_hidden(["powercfg", "/setacvalueindex", "SCHEME_CURRENT", GUID_SUB_PROCESSOR, GUID_PROCTHROTTLEMAX, str(max_cpu_pct)])
+        run_hidden(["powercfg", "/setacvalueindex", "SCHEME_CURRENT", GUID_SUB_PROCESSOR, GUID_PERFBOOSTMODE, "0"])
+        run_hidden(["powercfg", "/setacvalueindex", "SCHEME_CURRENT", GUID_SUB_PROCESSOR, GUID_COOLINGPOLICY, "0"])
+        run_hidden(["powercfg", "/setactive", "SCHEME_CURRENT"])
+        kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
+
+    def restore_normal_cpu(self) -> None:
+        run_hidden(["powercfg", "/setacvalueindex", "SCHEME_CURRENT", GUID_SUB_PROCESSOR, GUID_PROCTHROTTLEMAX, "100"])
+        run_hidden(["powercfg", "/setacvalueindex", "SCHEME_CURRENT", GUID_SUB_PROCESSOR, GUID_PERFBOOSTMODE, "2"])
+        run_hidden(["powercfg", "/setacvalueindex", "SCHEME_CURRENT", GUID_SUB_PROCESSOR, GUID_COOLINGPOLICY, "1"])
+        run_hidden(["powercfg", "/setactive", "SCHEME_CURRENT"])
+        kernel32.SetThreadExecutionState(ES_CONTINUOUS)
+
+    def blackout_rgb(self) -> None:
+        try:
+            key_path = r"Software\Microsoft\Lighting"
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, key_path) as key:
+                for name in ("AmbientLightingEnabled", "Brightness"):
+                    try:
+                        val, _ = winreg.QueryValueEx(key, name)
+                        self.saved_lighting[name] = int(val)
+                    except FileNotFoundError:
+                        pass
+                winreg.SetValueEx(key, "Brightness", 0, winreg.REG_DWORD, 0)
+                winreg.SetValueEx(key, "AmbientLightingEnabled", 0, winreg.REG_DWORD, 0)
+        except Exception:
+            pass
+
+        openrgb = find_openrgb()
+        if openrgb:
+            threading.Thread(
+                target=run_hidden,
+                args=([openrgb, "--noautoconnect", "--color", "000000", "--brightness", "0"],),
+                daemon=True,
+            ).start()
+
+    def restore_rgb(self) -> None:
+        if self.saved_lighting:
+            try:
+                key_path = r"Software\Microsoft\Lighting"
+                with winreg.CreateKey(winreg.HKEY_CURRENT_USER, key_path) as key:
+                    for name, val in self.saved_lighting.items():
+                        winreg.SetValueEx(key, name, 0, winreg.REG_DWORD, int(val))
+            except Exception:
+                pass
+            self.saved_lighting.clear()
+
+        openrgb = find_openrgb()
+        if openrgb:
+            threading.Thread(
+                target=run_hidden,
+                args=([openrgb, "--noautoconnect", "--color", "00AAFF", "--brightness", "100"],),
+                daemon=True,
+            ).start()
+
+    def start_or_throttle_training(self, rounds: int = 800_000) -> str:
+        root = Path(__file__).resolve().parent
+        train_script = root / "train.py"
+        if not train_script.exists():
+            return "train.py not found in folder (Stealth Mode running standalone)"
+
+        if self.train_proc is None or self.train_proc.poll() is not None:
+            env = os.environ.copy()
+            env["RAYON_NUM_THREADS"] = "4"
+            env["OMP_NUM_THREADS"] = "4"
+            env["MKL_NUM_THREADS"] = "4"
+
+            log_dir = root / "logs"
+            log_dir.mkdir(exist_ok=True)
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            self.log_handle = open(log_dir / f"stealth_train_{stamp}.log", "w", encoding="utf-8")
+
+            cmd = [sys.executable, "-u", str(train_script), "--rounds", str(rounds)]
+            latest_ckpt = root / "plump_transformer_latest.pt"
+            if latest_ckpt.exists():
+                cmd += ["--resume", str(latest_ckpt)]
+
+            self.train_proc = subprocess.Popen(
+                cmd,
+                cwd=str(root),
+                env=env,
+                stdout=self.log_handle,
+                stderr=subprocess.STDOUT,
+                creationflags=IDLE_PRIORITY_CLASS | CREATE_NO_WINDOW,
+            )
+
+        self._apply_process_limits(stealth_on=True)
+        return f"Training PID {self.train_proc.pid} running in Whisper-Quiet Eco Mode"
+
+    def _apply_process_limits(self, stealth_on: bool) -> None:
+        self.pacer_stop.set()
+        if self.train_proc is None or self.train_proc.poll() is not None:
+            return
+        pid = self.train_proc.pid
+        handle = kernel32.OpenProcess(PROCESS_ALL_ACCESS, False, pid)
+        if not handle:
+            return
+        try:
+            if stealth_on:
+                kernel32.SetPriorityClass(handle, IDLE_PRIORITY_CLASS)
+                kernel32.SetProcessAffinityMask(handle, DWORD_PTR(0x0F))
+            else:
+                ntdll.NtResumeProcess(handle)
+                kernel32.SetPriorityClass(handle, NORMAL_PRIORITY_CLASS)
+                system_mask = DWORD_PTR()
+                process_mask = DWORD_PTR()
+                if kernel32.GetProcessAffinityMask(handle, ctypes.byref(process_mask), ctypes.byref(system_mask)):
+                    kernel32.SetProcessAffinityMask(handle, system_mask)
+        finally:
+            kernel32.CloseHandle(handle)
+
+        if stealth_on and self.gpu_quiet_duty < 0.99:
+            self.pacer_stop.clear()
+            self.pacer_thread = threading.Thread(
+                target=self._gpu_pacer_loop, args=(pid,), daemon=True
+            )
+            self.pacer_thread.start()
+
+    def _gpu_pacer_loop(self, pid: int) -> None:
+        handle = kernel32.OpenProcess(PROCESS_ALL_ACCESS, False, pid)
+        if not handle:
+            return
+        cycle = 0.080
+        try:
+            while not self.pacer_stop.is_set():
+                duty = max(0.20, min(1.0, self.gpu_quiet_duty))
+                if duty >= 0.99:
+                    time.sleep(0.25)
+                    continue
+                run_time = cycle * duty
+                sleep_time = cycle * (1.0 - duty)
+                ntdll.NtResumeProcess(handle)
+                time.sleep(run_time)
+                if self.pacer_stop.is_set():
+                    break
+                ntdll.NtSuspendProcess(handle)
+                time.sleep(sleep_time)
+        finally:
+            ntdll.NtResumeProcess(handle)
+            kernel32.CloseHandle(handle)
+
+    def enable_stealth(
+        self,
+        launch_train: bool = True,
+        mute_audio: bool = True,
+        blackout: bool = True,
+        cpu_cap: int = 80,
+        gpu_duty: int = 55,
+    ) -> str:
+        self.active = True
+        self.gpu_quiet_duty = gpu_duty / 100.0
+        self.apply_quiet_cpu(max_cpu_pct=cpu_cap)
+        if blackout:
+            self.blackout_rgb()
+        if mute_audio and not self.muted_by_us:
+            toggle_system_mute()
+            self.muted_by_us = True
+        msg = "Stealth Mode Active"
+        if launch_train:
+            msg = self.start_or_throttle_training()
+        if blackout:
+            set_monitors_power(turn_off=True)
+        return msg
+
+    def disable_stealth(self) -> None:
+        if not self.active:
+            return
+        self.active = False
+        self.pacer_stop.set()
+        set_monitors_power(turn_off=False)
+        self.restore_normal_cpu()
+        self.restore_rgb()
+        self._apply_process_limits(stealth_on=False)
+        if self.muted_by_us:
+            toggle_system_mute()
+            self.muted_by_us = False
+
+
+class StealthApp:
+    def __init__(self, ctrl: StealthController, start_immediately: bool = False) -> None:
+        self.ctrl = ctrl
+        self.root = tk.Tk()
+        self.root.title("Bedroom Stealth Overnight Controller (Admin)")
+        self.root.geometry("520x475")
+        self.root.configure(bg="#121212")
+        self.root.resizable(False, False)
+
+        self.ctrl.restore_normal_cpu()
+
+        self.var_train = tk.BooleanVar(value=True)
+        self.var_blackout = tk.BooleanVar(value=True)
+        self.var_mute = tk.BooleanVar(value=True)
+        self.var_cpu_cap = tk.IntVar(value=80)
+        self.var_gpu_duty = tk.IntVar(value=55)
+        self.status_var = tk.StringVar(value="Status: Normal Mode (Admin access active for internal PC RGB)")
+
+        self._build_ui()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        if start_immediately:
+            self.root.after(500, self.start_countdown)
+
+    def _build_ui(self) -> None:
+        bg = "#121212"
+        fg = "#E0E0E0"
+        accent = "#00C853"
+
+        tk.Label(
+            self.root,
+            text="BEDROOM STEALTH MODE",
+            font=("Segoe UI", 15, "bold"),
+            bg=bg,
+            fg="#FFFFFF",
+        ).pack(pady=(12, 2))
+
+        tk.Label(
+            self.root,
+            text="Zero Lights • Zero Fan Ramp-Up • Wiggle Mouse to Wake",
+            font=("Segoe UI", 9),
+            bg=bg,
+            fg="#9E9E9E",
+        ).pack(pady=(0, 10))
+
+        frame = tk.Frame(self.root, bg="#1E1E1E", padx=16, pady=10)
+        frame.pack(fill="x", padx=20)
+
+        for text, var in (
+            ("Launch / Resume Plump AI Training (train.py)", self.var_train),
+            ("Blackout Monitors + Peripherals + Case RGB", self.var_blackout),
+            ("Mute Windows Audio Overnight (No 3 AM Pings)", self.var_mute),
+        ):
+            tk.Checkbutton(
+                frame,
+                text=text,
+                variable=var,
+                bg="#1E1E1E",
+                fg=fg,
+                selectcolor="#2C2C2C",
+                activebackground="#1E1E1E",
+                activeforeground="#FFFFFF",
+                font=("Segoe UI", 10),
+            ).pack(anchor="w", pady=2)
+
+        s_frame = tk.Frame(frame, bg="#1E1E1E")
+        s_frame.pack(fill="x", pady=(6, 2))
+        tk.Label(
+            s_frame,
+            text="CPU Cap % (<=95% disables loud Turbo Boost):",
+            bg="#1E1E1E",
+            fg=fg,
+            font=("Segoe UI", 9),
+        ).pack(anchor="w")
+        tk.Scale(
+            s_frame,
+            from_=50,
+            to=95,
+            orient="horizontal",
+            variable=self.var_cpu_cap,
+            bg="#1E1E1E",
+            fg=fg,
+            highlightthickness=0,
+            troughcolor="#333333",
+        ).pack(fill="x")
+
+        tk.Label(
+            s_frame,
+            text="RX 9060 XT Quiet Duty % (55% = 0-RPM Fan Stop):",
+            bg="#1E1E1E",
+            fg=fg,
+            font=("Segoe UI", 9),
+        ).pack(anchor="w", pady=(4, 0))
+        tk.Scale(
+            s_frame,
+            from_=25,
+            to=100,
+            orient="horizontal",
+            variable=self.var_gpu_duty,
+            bg="#1E1E1E",
+            fg=fg,
+            highlightthickness=0,
+            troughcolor="#333333",
+        ).pack(fill="x")
+
+        self.btn_activate = tk.Button(
+            self.root,
+            text="ACTIVATE STEALTH MODE (10s Grace -> Wiggle Mouse to Wake)",
+            command=self.start_countdown,
+            bg=accent,
+            fg="#000000",
+            font=("Segoe UI", 10, "bold"),
+            relief="flat",
+            pady=10,
+            cursor="hand2",
+        )
+        self.btn_activate.pack(fill="x", padx=20, pady=(12, 6))
+
+        btn_row = tk.Frame(self.root, bg=bg)
+        btn_row.pack(fill="x", padx=20, pady=(0, 6))
+
+        if not is_pawnio_installed():
+            tk.Button(
+                btn_row,
+                text="1. Install PawnIO Driver (For Case Fans/RAM)",
+                command=self.install_pawnio,
+                bg="#2C2C2C",
+                fg="#FFD54F",
+                font=("Segoe UI", 8, "bold"),
+                relief="flat",
+                pady=4,
+            ).pack(side="left", expand=True, fill="x", padx=(0, 4))
+
+        tk.Button(
+            btn_row,
+            text="Configure Case Fans in OpenRGB (1-Time Setup)",
+            command=self.open_openrgb_gui,
+            bg="#2C2C2C",
+            fg="#80D8FF",
+            font=("Segoe UI", 8),
+            relief="flat",
+            pady=4,
+        ).pack(side="left", expand=True, fill="x")
+
+        tk.Label(
+            self.root,
+            textvariable=self.status_var,
+            font=("Segoe UI", 9, "bold"),
+            bg=bg,
+            fg="#80D8FF",
+            wraplength=480,
+        ).pack(pady=(4, 0))
+
+    def install_pawnio(self) -> None:
+        self.status_var.set("Installing PawnIO driver for motherboard/fan RGB headers...")
+        subprocess.Popen(["cmd", "/c", "winget install -e --id namazso.PawnIO & pause"])
+
+    def open_openrgb_gui(self) -> None:
+        openrgb = find_openrgb()
+        if not openrgb:
+            subprocess.Popen(
+                ["cmd", "/c", "winget install -e --id OpenRGB.OpenRGB --skip-dependencies & pause"]
+            )
+            return
+        self.status_var.set(
+            "Opening OpenRGB as Admin: Resize your Motherboard ARGB zones to 30 LEDs, then close it!"
+        )
+        subprocess.Popen([openrgb])
+
+    def start_countdown(self) -> None:
+        if self.ctrl.active:
+            self.ctrl.disable_stealth()
+            self.btn_activate.configure(
+                text="ACTIVATE STEALTH MODE (10s Grace -> Wiggle Mouse to Wake)",
+                bg="#00C853",
+            )
+            self.status_var.set("Restored Normal Mode (100% CPU/GPU Speed & Lights ON)")
+            return
+
+        self.btn_activate.configure(state="disabled")
+        self._tick_countdown(10)
+
+    def _tick_countdown(self, remaining: int) -> None:
+        if remaining > 0:
+            self.status_var.set(
+                f"Going dark in {remaining}s... Let go of your mouse! (Wiggle in the morning to wake)"
+            )
+            self.root.after(1000, self._tick_countdown, remaining - 1)
+        else:
+            self._engage()
+
+    def _engage(self) -> None:
+        msg = self.ctrl.enable_stealth(
+            launch_train=self.var_train.get(),
+            mute_audio=self.var_mute.get(),
+            blackout=self.var_blackout.get(),
+            cpu_cap=self.var_cpu_cap.get(),
+            gpu_duty=self.var_gpu_duty.get(),
+        )
+        self.btn_activate.configure(
+            state="normal",
+            text="STEALTH ACTIVE — Wiggle Mouse or Click Here to Wake",
+            bg="#FFAB00",
+        )
+        self.status_var.set(f"{msg} | Waiting for morning mouse wiggle...")
+        self.root.after(1500, self._arm_mouse_watcher)
+
+    def _arm_mouse_watcher(self) -> None:
+        self.anchor_pos = get_cursor_pos()
+        self._poll_wake()
+
+    def _poll_wake(self) -> None:
+        if not self.ctrl.active:
+            return
+        x, y = get_cursor_pos()
+        ax, ay = self.anchor_pos
+        dist_sq = (x - ax) ** 2 + (y - ay) ** 2
+
+        if dist_sq > 35 * 35 or wake_key_pressed():
+            self.ctrl.disable_stealth()
+            self.btn_activate.configure(
+                text="ACTIVATE STEALTH MODE (10s Grace -> Wiggle Mouse to Wake)",
+                bg="#00C853",
+            )
+            self.status_var.set(
+                "Good morning! Stealth Mode disabled & 100% PC speed restored. (Training continues in background)"
+            )
+            return
+
+        self.root.after(250, self._poll_wake)
+
+    def _on_close(self) -> None:
+        self.ctrl.disable_stealth()
+        if self.ctrl.train_proc and self.ctrl.train_proc.poll() is None:
+            self.ctrl.train_proc.terminate()
+        if self.ctrl.log_handle:
+            self.ctrl.log_handle.close()
+        self.root.destroy()
+
+    def run(self) -> None:
+        self.root.mainloop()
+
+
+if __name__ == "__main__":
+    ensure_admin()
+    parser = argparse.ArgumentParser(description="Windows 11 Bedroom Stealth Controller")
+    parser.add_argument("--now", action="store_true", help="Start 10s stealth countdown immediately")
+    args = parser.parse_args()
+
+    controller = StealthController()
+    app = StealthApp(controller, start_immediately=args.now)
+    app.run()
 </file>
 
 <file path="crates/plump-engine/src/engine.rs">
@@ -3864,6 +5196,7 @@ mod tests {
 //! and a parallel vectorised environment for reinforcement learning.
 
 pub mod augment;
+pub mod bots;
 pub mod engine;
 pub mod search;
 pub mod vec_env;
@@ -3871,6 +5204,10 @@ pub mod vec_env;
 #[cfg(feature = "python")]
 pub mod python;
 
+pub use bots::{
+    bot_action, final_boss_card, regular_bid, regular_card, rookie_bid, rookie_card,
+    tactician_bid, tactician_card, BOT_FINAL_BOSS, BOT_REGULAR, BOT_ROOKIE, BOT_TACTICIAN,
+};
 pub use engine::{
     card_index, display_points, rank_of, suit_of, terminal_reward, FastEnv, Phase, BID_BASE,
     CARD_BASE, FEAT_DIM, MAX_SEQ, PAD_TOK, PLAYER_BASE, ROUND_SCHEDULE, VOCAB,
@@ -3947,105 +5284,16 @@ fn table_bits(env: &FastEnv) -> u64 {
     bits
 }
 
-/// Pick the card that best ducks under the current led-suit winner, or the
-/// lowest legal card when leading / when ducking is impossible.
-#[inline]
-fn best_led_rank(env: &FastEnv) -> u8 {
-    let mut best = 0u8;
-    for i in 0..env.table_len as usize {
-        let card = env.table[i].1;
-        if suit_of(card) == env.led_suit {
-            best = best.max(card % 13);
-        }
-    }
-    best
-}
-
-fn highest_card(cards: &[u8]) -> u8 {
-    *cards
-        .iter()
-        .max_by_key(|&&c| (rank_of(c) as i16) * 8 + suit_of(c) as i16)
-        .unwrap()
-}
-
-fn lowest_card(cards: &[u8]) -> u8 {
-    *cards
-        .iter()
-        .min_by_key(|&&c| (rank_of(c) as i16) * 8 + suit_of(c) as i16)
-        .unwrap()
-}
-
 /// Heuristic card for rollouts and for the `--search 0` greedy mode.
+/// Upgraded to Tactician bot so rollouts are significantly smarter.
 pub fn heuristic_card(env: &FastEnv) -> u8 {
-    let p = env.current_player as usize;
-    let legal = env.legal_cards_mask(p);
-    debug_assert!(legal != 0);
-    let cards = cards_from_mask(legal);
-    if cards.len() == 1 {
-        return cards[0];
-    }
-
-    let bid = env.bids[p].max(0) as i32;
-    let tricks = env.tricks_won[p] as i32;
-
-    if env.table_len == 0 {
-        return if tricks < bid {
-            highest_card(&cards)
-        } else {
-            lowest_card(&cards)
-        };
-    }
-
-    let led = env.led_suit;
-    let best = best_led_rank(env);
-
-    if tricks < bid {
-        // Still need tricks: win the trick if possible, otherwise dump low.
-        let mut winning: Vec<u8> = cards
-            .iter()
-            .copied()
-            .filter(|&c| suit_of(c) == led && c % 13 > best)
-            .collect();
-        if winning.is_empty() {
-            lowest_card(&cards)
-        } else {
-            winning.sort_by_key(|&c| c % 13);
-            *winning.last().unwrap()
-        }
-    } else {
-        // Bid already made: duck under the current winner if possible.
-        let mut ducks: Vec<u8> = cards
-            .iter()
-            .copied()
-            .filter(|&c| suit_of(c) != led || c % 13 < best)
-            .collect();
-        if ducks.is_empty() {
-            lowest_card(&cards)
-        } else {
-            ducks.sort_by_key(|&c| c % 13);
-            *ducks.last().unwrap()
-        }
-    }
+    crate::bots::tactician_card(env)
 }
 
-/// Conservative bid used by rollouts (and as a heuristic baseline).
+/// Heuristic bid used by rollouts (and as a heuristic baseline).
+/// Upgraded to Tactician bot so rollouts are significantly smarter.
 pub fn heuristic_bid(env: &FastEnv) -> u8 {
-    let p = env.current_player as usize;
-    let mask = env.legal_bids_mask(p);
-    if mask == 0 {
-        return 0;
-    }
-    let target = (env.round_cards as i32 / 4).clamp(0, env.round_cards as i32);
-    let mut best = 0u8;
-    let mut best_dist = i32::MAX;
-    for bid in bids_from_mask(mask) {
-        let dist = (bid as i32 - target).abs();
-        if dist < best_dist {
-            best_dist = dist;
-            best = bid;
-        }
-    }
-    best
+    crate::bots::tactician_bid(env)
 }
 
 fn rollout(mut env: FastEnv) -> [f32; 4] {
@@ -5140,10 +6388,16 @@ import torch
 
 from ..models.transformer import PlumpTransformer
 
-# 0 = hand-written heuristic, 1 = uniform random, >= 2 = frozen champion.
-HEURISTIC = 0
-RANDOM = 1
-CHAMPION_BASE = 2
+# Bot policy IDs (0..=3 match plump_engine bot levels) and frozen champions (>= 4)
+ROOKIE = 0
+REGULAR = 1
+TACTICIAN = 2
+FINAL_BOSS = 3
+CHAMPION_BASE = 4
+
+# Aliases for backward compatibility
+HEURISTIC = TACTICIAN
+RANDOM = ROOKIE
 
 
 class League:
@@ -5208,15 +6462,26 @@ class League:
             )
 
     def sample_policy(self) -> int:
-        """Sample one of heuristic/random/champion for a league round."""
-        if not self.champions:
-            return HEURISTIC if self.rng.random() < 0.8 else RANDOM
+        """Sample one of Rookie/Regular/Tactician/FinalBoss/Champion for a league round."""
         roll = self.rng.random()
-        if roll < 0.70:
+        if self.champions:
+            if roll < 0.10:
+                return ROOKIE
+            if roll < 0.30:
+                return REGULAR
+            if roll < 0.60:
+                return TACTICIAN
+            if roll < 0.70:
+                return TACTICIAN
             return CHAMPION_BASE + self.rng.randrange(len(self.champions))
+        # No champions yet: redistribute the 30% champion share to Tactician (+20%) and Regular (+10%)
+        if roll < 0.10:
+            return ROOKIE
+        if roll < 0.40:
+            return REGULAR
         if roll < 0.90:
-            return HEURISTIC
-        return RANDOM
+            return TACTICIAN
+        return TACTICIAN
 
     def model_for(self, policy: int) -> Optional[PlumpTransformer]:
         if policy >= CHAMPION_BASE:
@@ -5236,6 +6501,7 @@ class League:
 target/
 .env
 .venv/
+.venv
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -5332,6 +6598,8 @@ class PlaySettings:
     use_search: bool
     worlds: int
     model_available: bool
+    bot_level: Optional[int] = None
+    bot_name: str = "none"
 
 
 @dataclass
@@ -5499,27 +6767,49 @@ def model_q(model, env, player: int, phase: str, device: torch.device) -> np.nda
     return q
 
 
+def _tricks_expected_bid_values(tricks_logits: np.ndarray, round_cards: int) -> np.ndarray:
+    probs = np.exp(tricks_logits - np.max(tricks_logits))
+    probs = probs / np.sum(probs)
+    ev = np.full(11, -np.inf, dtype=np.float32)
+    ks = np.arange(11, dtype=np.float32)
+    for b in range(round_cards + 1):
+        made_rew = 5.0 if b == 0 else (10.0 + float(b))
+        rewards = np.where(ks == b, made_rew, -2.0 * np.abs(ks - float(b)))
+        ev[b] = float(np.sum(probs * rewards))
+    return ev
+
+
 def choose_bid(env, model, settings: PlaySettings, device) -> Tuple[int, Decision]:
     player = int(env.current_player)
+    round_cards = int(env.round_cards)
     legal = mask_to_bool(int(env.legal_bids_mask(player)), 11)
     start = time.perf_counter()
-    if model is None:
-        bid = heuristic_bid(legal, int(env.round_cards))
+    if settings.bot_level is not None:
+        bid = int(env.bot_action(settings.bot_level))
+        decision = Decision(f"{settings.bot_name} bot")
+    elif model is None:
+        bid = heuristic_bid(legal, round_cards)
         decision = Decision("heuristic")
-    elif settings.use_search and int(env.round_cards) == 1:
+    elif settings.use_search and round_cards == 1:
         q = model_q(model, env, player, "bid", device)
         ev = np.asarray(env.search_pannplump_bid_values(), dtype=np.float32)
-        combined = 0.5 * normalized_prior(q, legal) + 0.5 * normalized_prior(
-            ev, legal
-        )
-        bid = int(np.argmax(combined))
+        combined = 0.5 * q + 0.5 * ev
+        bid = int(np.argmax(np.where(legal, combined, -np.inf)))
         decision = Decision(
             "pannplump + bid head", extra=f"q={q[bid]:.2f}, ev={ev[bid]:.2f}"
         )
     else:
-        q = model_q(model, env, player, "bid", device)
-        bid = int(masked_argmax(q[None, :], legal[None, :])[0])
-        decision = Decision("bid head", extra=f"q={q[bid]:.2f}")
+        tokens, feats = encode_tensors(env, player, device)
+        with torch.inference_mode():
+            q_out, _, tricks_logits = model.forward_with_aux(tokens, feats, phase="bid")
+            q = q_out[0].float().cpu().numpy()
+            t_logits = tricks_logits[0].float().cpu().numpy()
+        t_ev = _tricks_expected_bid_values(t_logits, round_cards)
+        tac_bid = int(env.bot_action(2))
+        tac_prior = -1.5 * np.abs(np.arange(11, dtype=np.float32) - float(tac_bid))
+        combined = 0.35 * q + 0.45 * t_ev + 0.20 * tac_prior
+        bid = int(np.argmax(np.where(legal, combined, -np.inf)))
+        decision = Decision("bid+tricks head", extra=f"q={q[bid]:.2f}, tev={t_ev[bid]:.2f}")
     decision.elapsed_ms = (time.perf_counter() - start) * 1000.0
     return bid, decision
 
@@ -5533,7 +6823,10 @@ def choose_card(env, model, settings: PlaySettings, device) -> Tuple[int, Decisi
         decision = Decision("only legal card")
         decision.elapsed_ms = (time.perf_counter() - start) * 1000.0
         return card, decision
-    if model is None:
+    if settings.bot_level is not None:
+        card = int(env.bot_action(settings.bot_level))
+        decision = Decision(f"{settings.bot_name} bot")
+    elif model is None:
         bid = int(env.bids[player])
         tricks = int(env.tricks_won[player])
         card = heuristic_play(legal, bid, tricks)
@@ -5553,14 +6846,12 @@ def choose_card(env, model, settings: PlaySettings, device) -> Tuple[int, Decisi
         state = env.state()
         tricks_left = int(env.round_cards) - int(state["current_trick"])
         if tricks_left <= 5:
-            q_weight, ev_weight = 0.25, 0.75
+            q_weight, ev_weight = 0.35, 0.65
             mode = "endgame"
         else:
-            q_weight, ev_weight = 0.50, 0.50
+            q_weight, ev_weight = 0.65, 0.35
             mode = "midgame"
-        combined = q_weight * normalized_prior(
-            q, legal
-        ) + ev_weight * normalized_prior(ev, legal)
+        combined = q_weight * q + ev_weight * ev
         card = int(np.argmax(np.where(legal, combined, -np.inf)))
         decision = Decision(
             f"PIMC {settings.worlds}w + play head",
@@ -5999,7 +7290,147 @@ def play(
     show_final(console, totals, plumps)
 
 
+def run_gauntlet(console: Console, model: Optional[torch.nn.Module], device: torch.device) -> None:
+    challenger_name = "Transformer Model" if model is not None else "Tactician Bot"
+    console.print(
+        Panel.fit(
+            f"[bold]Boss Gauntlet Benchmark[/]\n"
+            f"Challenger: [bold cyan]{challenger_name}[/]\n"
+            f"Pitting challenger across all 4 seats against the 4-tier bot ladder.",
+            border_style="blue",
+        )
+    )
+
+    boss_info = [
+        ("Rookie", "Lv.1 Rookie", 0, 32, 10),
+        ("Regular", "Lv.2 Regular", 1, 32, 10),
+        ("Tactician", "Lv.3 Tactician", 2, 32, 10),
+        ("Final Boss", "Lv.4 Final Boss", 3, 16, 5),
+    ]
+
+    results = []
+    fighting_found = False
+
+    for name, label, bot_level, num_envs, rounds_per_seat in boss_info:
+        total_points = 0.0
+        total_opp_points = 0.0
+        total_rounds = 0
+        total_made = 0
+
+        for seat in range(4):
+            vec = plump_engine.PyRustVecEnv(
+                num_envs, seed=42 + bot_level * 100 + seat * 17
+            )
+            seat_rounds = 0
+            while seat_rounds < rounds_per_seat:
+                obs = vec.observe_batch()
+                toks, feats, legal, is_bid, players = obs
+                n = len(toks)
+                actions = np.zeros(n, dtype=np.uint8)
+                controlled = np.asarray(players) == seat
+
+                # Challenger actions
+                learner_idx = np.flatnonzero(controlled)
+                if len(learner_idx):
+                    if model is not None:
+                        for bidding in (True, False):
+                            phase_mask = np.asarray(is_bid, dtype=np.bool_) == bidding
+                            sub_idx = np.flatnonzero(controlled & phase_mask)
+                            if len(sub_idx) == 0:
+                                continue
+                            phase = "bid" if bidding else "play"
+                            n_actions = 11 if bidding else 52
+                            tokens = torch.from_numpy(toks[sub_idx]).long().to(device)
+                            features = torch.from_numpy(feats[sub_idx]).float().to(device)
+                            with torch.inference_mode():
+                                q = model(tokens, features, phase=phase).float().cpu().numpy()
+                            legal_rows = legal[sub_idx][:, :n_actions].astype(np.bool_)
+                            actions[sub_idx] = masked_argmax(q, legal_rows).astype(np.uint8)
+                    else:
+                        bot_acts = np.asarray(
+                            vec.bot_actions(np.full(n, 2, dtype=np.uint8))
+                        )
+                        actions[learner_idx] = bot_acts[learner_idx]
+
+                # Opponents bot actions
+                opp_idx = np.flatnonzero(~controlled)
+                if len(opp_idx):
+                    bot_acts = np.asarray(
+                        vec.bot_actions(np.full(n, bot_level, dtype=np.uint8))
+                    )
+                    actions[opp_idx] = bot_acts[opp_idx]
+
+                out = vec.step_batch(actions.tolist())
+                summaries = out["summaries"]
+                for j in range(len(summaries["env_indices"])):
+                    if seat_rounds >= rounds_per_seat:
+                        break
+                    bid = int(summaries["bids"][j, seat])
+                    tricks = int(summaries["tricks_won"][j, seat])
+                    points = float(summaries["points"][j, seat])
+                    opp_pts = float(
+                        (summaries["points"][j].sum() - summaries["points"][j, seat])
+                        / 3.0
+                    )
+                    total_points += points
+                    total_opp_points += opp_pts
+                    total_made += int(tricks == bid)
+                    seat_rounds += 1
+                    total_rounds += 1
+            del vec
+
+        ai_pts = total_points / max(1, total_rounds)
+        bot_pts = total_opp_points / max(1, total_rounds)
+        margin = ai_pts - bot_pts
+        made_rate = total_made / max(1, total_rounds)
+
+        if not fighting_found:
+            if margin > 0.001:
+                status = "[bold green][✓ DEFEATED][/bold green]"
+            else:
+                status = "[bold yellow][⚔ FIGHTING][/bold yellow]"
+                fighting_found = True
+        else:
+            status = "[dim][🔒 LOCKED  ][/dim]"
+
+        results.append((status, label, ai_pts, bot_pts, margin, made_rate, total_rounds))
+
+    table = Table(
+        title="[bold]Boss Gauntlet Benchmark Results[/bold]",
+        box=box.ROUNDED,
+        header_style="bold cyan",
+        show_lines=True,
+    )
+    table.add_column("Status", justify="center")
+    table.add_column("Boss Tier", justify="left")
+    table.add_column("Challenger Avg", justify="right")
+    table.add_column("Boss Avg", justify="right")
+    table.add_column("Margin", justify="right")
+    table.add_column("Made Bid %", justify="right")
+    table.add_column("Rounds", justify="center", style="dim")
+
+    for status, label, ai_pts, bot_pts, margin, made_rate, rounds in results:
+        margin_str = (
+            f"[bold green]+{margin:.2f}[/bold green]"
+            if margin > 0
+            else f"[bold red]{margin:.2f}[/bold red]"
+        )
+        table.add_row(
+            status,
+            label,
+            f"{ai_pts:.2f} pts",
+            f"{bot_pts:.2f} pts",
+            margin_str,
+            f"{made_rate:4.1%}",
+            str(rounds),
+        )
+
+    console.print(table)
+
+
 def load_ai_model(args, console: Console, device: torch.device):
+    if getattr(args, "bot", "none") != "none" and not getattr(args, "gauntlet", False):
+        return None
     if args.no_model:
         console.print("[yellow]Model disabled; AI uses the heuristic fallback.[/yellow]")
         return None
@@ -6040,6 +7471,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--max-rounds", type=int, default=len(ROUND_SCHEDULE))
+    parser.add_argument(
+        "--bot",
+        choices=["none", "rookie", "regular", "tactician", "boss"],
+        default="none",
+        help="Play against hardcoded bot tier (none, rookie, regular, tactician, boss)",
+    )
+    parser.add_argument(
+        "--gauntlet",
+        action="store_true",
+        help="Run fast head-to-head Boss Gauntlet benchmark and exit",
+    )
     return parser.parse_args()
 
 
@@ -6051,39 +7493,86 @@ def main() -> None:
     else:
         device = torch.device(args.device)
 
-    model = load_ai_model(args, console, device)
-    settings = PlaySettings(
-        autoplay=args.autoplay,
-        use_search=args.search > 0 and model is not None,
-        worlds=args.search if args.search > 0 else 32,
-        model_available=model is not None,
-    )
+    if args.gauntlet:
+        model = None if args.no_model else load_ai_model(args, console, device)
+        run_gauntlet(console, model, device)
+        return
 
-    if args.autoplay:
-        search_desc = (
-            f"on ({settings.worlds} worlds)"
-            if settings.use_search
-            else "off (policy head)"
-        )
-        console.print(
-            Panel.fit(
-                f"[bold]Autoplay[/] {DASH} 4 AI players {DASH} "
-                f"search {search_desc} {DASH} model "
-                f"{'loaded' if model is not None else 'heuristic'}",
-                border_style="green",
-            )
+    bot_level_map = {
+        "rookie": 0,
+        "regular": 1,
+        "tactician": 2,
+        "boss": 3,
+    }
+    bot_level = bot_level_map.get(args.bot)
+    bot_name = "Final Boss" if args.bot == "boss" else args.bot.capitalize()
+
+    if bot_level is not None:
+        model = None
+        settings = PlaySettings(
+            autoplay=args.autoplay,
+            use_search=False,
+            worlds=0,
+            model_available=False,
+            bot_level=bot_level,
+            bot_name=bot_name,
         )
     else:
-        console.print(
-            Panel.fit(
-                "[bold]Swedish Plump[/]\n"
-                "20 rounds: 10 cards down to 1, then back up to 10.\n"
-                "Bid exactly your tricks to score. Miss and it is a plump.\n"
-                "You are Seat 0. Type 'help' for commands.",
-                title="Welcome",
-                border_style="green",
-            )
+        model = load_ai_model(args, console, device)
+        settings = PlaySettings(
+            autoplay=args.autoplay,
+            use_search=args.search > 0 and model is not None,
+            worlds=args.search if args.search > 0 else 32,
+            model_available=model is not None,
+            bot_level=None,
+            bot_name="none",
         )
+
+    if args.autoplay:
+        if settings.bot_level is not None:
+            console.print(
+                Panel.fit(
+                    f"[bold]Autoplay[/] {DASH} 4 {settings.bot_name} Bots",
+                    border_style="green",
+                )
+            )
+        else:
+            search_desc = (
+                f"on ({settings.worlds} worlds)"
+                if settings.use_search
+                else "off (policy head)"
+            )
+            console.print(
+                Panel.fit(
+                    f"[bold]Autoplay[/] {DASH} 4 AI players {DASH} "
+                    f"search {search_desc} {DASH} model "
+                    f"{'loaded' if model is not None else 'heuristic'}",
+                    border_style="green",
+                )
+            )
+    else:
+        if settings.bot_level is not None:
+            console.print(
+                Panel.fit(
+                    f"[bold]Swedish Plump vs {settings.bot_name} Bot[/]\n"
+                    "20 rounds: 10 cards down to 1, then back up to 10.\n"
+                    f"Opponents (Seats 1, 2, 3) are powered by the {settings.bot_name} bot.\n"
+                    "You are Seat 0. Type 'help' for commands.",
+                    title="Welcome",
+                    border_style="green",
+                )
+            )
+        else:
+            console.print(
+                Panel.fit(
+                    "[bold]Swedish Plump[/]\n"
+                    "20 rounds: 10 cards down to 1, then back up to 10.\n"
+                    "Bid exactly your tricks to score. Miss and it is a plump.\n"
+                    "You are Seat 0. Type 'help' for commands.",
+                    title="Welcome",
+                    border_style="green",
+                )
+            )
 
     try:
         play(

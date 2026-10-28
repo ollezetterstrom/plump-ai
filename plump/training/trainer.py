@@ -18,9 +18,51 @@ from ..checkpoint import load_checkpoint, save_checkpoint
 from ..config import BID_BASE, PlumpTransformerConfig, TrainConfig
 from ..models.transformer import PlumpTransformer
 from .buffer import RingBuffer
-from .league import League
+from .league import CHAMPION_BASE, FINAL_BOSS, REGULAR, ROOKIE, TACTICIAN, League
 
 COMBO_MASKS = ((0, 1), (2, 3), (0, 2), (1, 3), (0, 3), (1, 2))
+
+
+def format_gauntlet_ladder(results: Dict[str, Dict[str, float]], round_num: int) -> str:
+    boss_info = [
+        ("Rookie", "Lv.1 Rookie"),
+        ("Regular", "Lv.2 Regular"),
+        ("Tactician", "Lv.3 Tactician"),
+        ("Final Boss", "Lv.4 Final Boss"),
+    ]
+    statuses = []
+    fighting_found = False
+    for name, _ in boss_info:
+        data = results.get(name, {})
+        margin = data.get("margin", 0.0)
+        if not fighting_found:
+            if margin > 0.0:
+                statuses.append("[✓ DEFEATED]")
+            else:
+                statuses.append("[⚔ FIGHTING]")
+                fighting_found = True
+        else:
+            statuses.append("[🔒 LOCKED  ]")
+
+    title = f" BOSS GAUNTLET (Round {round_num:,}) "
+    inner_width = 78
+    dashes = max(0, inner_width - len(title))
+    left_dashes = dashes // 2
+    right_dashes = dashes - left_dashes
+    top = "╭" + "─" * left_dashes + title + "─" * right_dashes + "╮"
+    bot = "╰" + "─" * inner_width + "╯"
+
+    lines = [top]
+    for (name, label), status in zip(boss_info, statuses):
+        data = results.get(name, {})
+        ai_pts = data.get("ai_avg_points", 0.0)
+        bot_pts = data.get("bot_avg_points", 0.0)
+        margin = data.get("margin", 0.0)
+        content = f"  {status} {label:<16} AI: {ai_pts:5.2f} pts | Bot: {bot_pts:5.2f} pts | Margin: {margin:+5.2f}"
+        pad = inner_width - len(content)
+        lines.append("│" + content + " " * max(0, pad) + "│")
+    lines.append(bot)
+    return "\n".join(lines)
 
 
 class PlumpTrainer:
@@ -64,6 +106,7 @@ class PlumpTrainer:
         self.grad_steps = int(payload.get("grad_steps", 0)) if payload else 0
         self.best_score = float(payload.get("best_score", -math.inf)) if payload else -math.inf
         self.last_eval_metrics: Optional[Dict] = None
+        self.last_gauntlet: Optional[Dict[str, Dict[str, float]]] = None
         self.last_train_metrics: Dict[str, float] = {}
         self.env_steps = 0
         self.train_calls = 0
@@ -127,9 +170,10 @@ class PlumpTrainer:
         legal_rows = legal[indices][:, :n_actions].astype(np.bool_)
         if not explore:
             return masked_argmax(q, legal_rows).astype(np.uint8)
-        eps = np.linspace(
-            self.cfg.epsilon_min, self.cfg.epsilon_max, self.cfg.num_envs
-        )[indices]
+        if bidding:
+            eps = np.linspace(0.02, 0.20, self.cfg.num_envs)[indices]
+        else:
+            eps = np.linspace(0.005, 0.03, self.cfg.num_envs)[indices]
         return epsilon_greedy(q, legal_rows, eps, self.rng_np)
 
     def _random_actions(
@@ -183,24 +227,28 @@ class PlumpTrainer:
             opponent_idx = phase_idx[~controlled[phase_idx]]
             if len(opponent_idx):
                 policies = self.opp_policy[opponent_idx]
-                for policy in np.unique(policies):
-                    group = opponent_idx[policies == policy]
-                    if policy >= 2:
+                # Fast vectorised Rust bots for policies 0..=3 (ROOKIE, REGULAR, TACTICIAN, FINAL_BOSS)
+                bot_mask = (policies >= 0) & (policies < CHAMPION_BASE)
+                if bot_mask.any():
+                    bot_group = opponent_idx[bot_mask]
+                    bot_levels = np.zeros(n, dtype=np.uint8)
+                    bot_levels[bot_group] = policies[bot_mask].astype(np.uint8)
+                    bot_acts = np.asarray(self.vec_env.bot_actions(bot_levels))
+                    actions[bot_group] = bot_acts[bot_group]
+                # Frozen champion models for policies >= CHAMPION_BASE
+                champ_mask = policies >= CHAMPION_BASE
+                if champ_mask.any():
+                    for policy in np.unique(policies[champ_mask]):
+                        group = opponent_idx[policies == policy]
                         champion = self.league.model_for(int(policy))
                         if champion is not None:
                             actions[group] = self._model_actions(
                                 champion, toks, feats, legal, group, bidding, False
                             )
                         else:
-                            actions[group] = self._heuristic_actions(
-                                toks, feats, legal, group, bidding
-                            )
-                    elif policy == 1:
-                        actions[group] = self._random_actions(legal, group, bidding)
-                    else:
-                        actions[group] = self._heuristic_actions(
-                            toks, feats, legal, group, bidding
-                        )
+                            bot_levels = np.full(n, TACTICIAN, dtype=np.uint8)
+                            bot_acts = np.asarray(self.vec_env.bot_actions(bot_levels))
+                            actions[group] = bot_acts[group]
         return actions
 
     def _ingest(self, out: dict) -> None:
@@ -237,9 +285,8 @@ class PlumpTrainer:
             return None
 
         self.train_calls += 1
-        # Rounds produce many more play decisions than bid decisions, so the
-        # bid replay sample is refreshed only on every fourth optimizer step.
-        use_bid = self.train_calls % 4 == 0 and len(self.bid_buffer) >= batch
+        # Train bidder on every step as soon as buffer is ready.
+        use_bid = len(self.bid_buffer) >= batch
         phases: list[tuple[str, RingBuffer]] = [("play", self.play_buffer)]
         if use_bid:
             phases.append(("bid", self.bid_buffer))
@@ -302,7 +349,7 @@ class PlumpTrainer:
         self.last_train_metrics = metrics
         return metrics
 
-    def _eval_actions(self, obs, learner_seat: int) -> np.ndarray:
+    def _eval_actions(self, obs, learner_seat: int, vec=None) -> np.ndarray:
         toks, feats, legal, is_bid, players = obs
         n = len(toks)
         actions = np.zeros(n, dtype=np.uint8)
@@ -320,9 +367,15 @@ class PlumpTrainer:
             if len(opponent_idx):
                 champion = self.league.champion()
                 if champion is None:
-                    actions[opponent_idx] = self._heuristic_actions(
-                        toks, feats, legal, opponent_idx, bidding
-                    )
+                    if vec is not None:
+                        bot_acts = np.asarray(
+                            vec.bot_actions(np.full(n, TACTICIAN, dtype=np.uint8))
+                        )
+                        actions[opponent_idx] = bot_acts[opponent_idx]
+                    else:
+                        actions[opponent_idx] = self._heuristic_actions(
+                            toks, feats, legal, opponent_idx, bidding
+                        )
                 else:
                     actions[opponent_idx] = self._model_actions(
                         champion, toks, feats, legal, opponent_idx, bidding, False
@@ -349,7 +402,7 @@ class PlumpTrainer:
             seat_tricks = 0
             while seat_rounds < target:
                 obs = vec.observe_batch()
-                actions = self._eval_actions(obs, seat)
+                actions = self._eval_actions(obs, seat, vec=vec)
                 out = vec.step_batch(actions.tolist())
                 summaries = out["summaries"]
                 for j in range(len(summaries["env_indices"])):
@@ -399,6 +452,99 @@ class PlumpTrainer:
         self.last_eval_metrics = metrics
         return metrics
 
+    def _evaluate_against_bot(
+        self, bot_level: int, rounds_per_seat: int = 20, num_envs: int = 20
+    ) -> Dict[str, float]:
+        self.model.eval()
+        total_points = 0.0
+        total_opp_points = 0.0
+        total_rounds = 0
+        total_made = 0
+        total_tricks = 0
+
+        # 20 envs = all 20 rounds of a real Plump game (10..1, 1..10)
+        num_envs = 20
+
+        for seat in range(4):
+            vec = plump_engine.PyRustVecEnv(
+                num_envs, seed=self.cfg.seed + 1000 + bot_level * 100 + seat * 17
+            )
+            finished_envs = set()
+            while len(finished_envs) < num_envs:
+                obs = vec.observe_batch()
+                toks, feats, legal, is_bid, players = obs
+                n = len(toks)
+                actions = np.zeros(n, dtype=np.uint8)
+                controlled = np.asarray(players) == seat
+
+                for bidding in (True, False):
+                    phase_idx = np.flatnonzero(np.asarray(is_bid, dtype=np.bool_) == bidding)
+                    if len(phase_idx) == 0:
+                        continue
+                    learner_idx = phase_idx[controlled[phase_idx]]
+                    if len(learner_idx):
+                        actions[learner_idx] = self._model_actions(
+                            self.model, toks, feats, legal, learner_idx, bidding, False
+                        )
+
+                opp_idx = np.flatnonzero(~controlled)
+                if len(opp_idx):
+                    bot_acts = np.asarray(
+                        vec.bot_actions(np.full(n, bot_level, dtype=np.uint8))
+                    )
+                    actions[opp_idx] = bot_acts[opp_idx]
+
+                out = vec.step_batch(actions.tolist())
+                summaries = out["summaries"]
+                for j, env_idx in enumerate(summaries["env_indices"]):
+                    env_idx = int(env_idx)
+                    # Only count the FIRST round finished by each of the 20 tables
+                    if env_idx in finished_envs:
+                        continue
+                    finished_envs.add(env_idx)
+                    bid = int(summaries["bids"][j, seat])
+                    tricks = int(summaries["tricks_won"][j, seat])
+                    points = float(summaries["points"][j, seat])
+                    opp_pts = float(
+                        (summaries["points"][j].sum() - summaries["points"][j, seat])
+                        / 3.0
+                    )
+                    total_points += points
+                    total_opp_points += opp_pts
+                    total_tricks += tricks
+                    total_made += int(tricks == bid)
+                    total_rounds += 1
+            del vec
+
+        avg_score = total_points / max(1, total_rounds)
+        opp_avg_score = total_opp_points / max(1, total_rounds)
+        margin = avg_score - opp_avg_score
+        made_rate = total_made / max(1, total_rounds)
+        avg_tricks = total_tricks / max(1, total_rounds)
+
+        return {
+            "ai_avg_points": avg_score,
+            "bot_avg_points": opp_avg_score,
+            "margin": margin,
+            "made_rate": made_rate,
+            "avg_tricks": avg_tricks,
+            "rounds": total_rounds,
+        }
+
+    def evaluate_gauntlet(
+        self, rounds_per_seat: int = 8
+    ) -> Dict[str, Dict[str, float]]:
+        bosses = [
+            ("Rookie", ROOKIE),
+            ("Regular", REGULAR),
+            ("Tactician", TACTICIAN),
+            ("Final Boss", FINAL_BOSS),
+        ]
+        results = {}
+        for name, level in bosses:
+            results[name] = self._evaluate_against_bot(level, rounds_per_seat=rounds_per_seat)
+        return results
+
     def save(self, best: bool = False) -> None:
         path = self.cfg.best_path if best else self.cfg.latest_path
         save_checkpoint(
@@ -443,29 +589,41 @@ class PlumpTrainer:
                 "seat {seat}: score={avg_points:.3f} opp={opp_avg_points:.3f} margin={margin:+.3f} "
                 "made={made_rate:.3f} tricks={avg_tricks:.2f}".format(**seat)
             )
+        if self.last_gauntlet:
+            lines.append("")
+            lines.append(format_gauntlet_ladder(self.last_gauntlet, self.rounds_seen))
+            for name, d in self.last_gauntlet.items():
+                lines.append(
+                    f"gauntlet_{name.lower().replace(' ', '_')}: ai={d['ai_avg_points']:.2f} "
+                    f"bot={d['bot_avg_points']:.2f} margin={d['margin']:+.2f} made={d['made_rate']:.1%}"
+                )
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     def _evaluate_and_checkpoint(self) -> Dict:
         was_training = self.model.training
         metrics = self.evaluate()
+        gauntlet = self.evaluate_gauntlet()
+        self.last_gauntlet = gauntlet
         self.model.train(was_training)
 
-        has_champion = self.league.champion() is not None
-        if has_champion:
-            improved = metrics["margin"] > 0.05
-        else:
-            improved = metrics["avg_score"] > self.best_score
-
+        gauntlet_score = sum(d["ai_avg_points"] for d in gauntlet.values()) / len(gauntlet)
+        gauntlet_margin = sum(d["margin"] for d in gauntlet.values()) / len(gauntlet)
         added = False
+        if metrics["margin"] > 0.05 or len(self.league) == 0:
+            added = bool(self.league.add_champion(self.model, gauntlet_score))
+
+        improved = (gauntlet_score > self.best_score) and (gauntlet_margin > 0.0)
         if improved:
-            self.best_score = metrics["avg_score"]
-            added = self.league.add_champion(self.model, metrics["avg_score"])
+            self.best_score = gauntlet_score
             self.save(best=True)
         elif not self.cfg.best_path.exists():
             self.save(best=True)
 
         self.save(best=False)
         self.write_session()
+
+        ladder_str = format_gauntlet_ladder(gauntlet, self.rounds_seen)
+        print("\n" + ladder_str, flush=True)
 
         elapsed = max(1e-9, time.time() - self._start_time)
         tm = self.last_train_metrics or {}

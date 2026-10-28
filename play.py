@@ -79,6 +79,8 @@ class PlaySettings:
     use_search: bool
     worlds: int
     model_available: bool
+    bot_level: Optional[int] = None
+    bot_name: str = "none"
 
 
 @dataclass
@@ -246,27 +248,49 @@ def model_q(model, env, player: int, phase: str, device: torch.device) -> np.nda
     return q
 
 
+def _tricks_expected_bid_values(tricks_logits: np.ndarray, round_cards: int) -> np.ndarray:
+    probs = np.exp(tricks_logits - np.max(tricks_logits))
+    probs = probs / np.sum(probs)
+    ev = np.full(11, -np.inf, dtype=np.float32)
+    ks = np.arange(11, dtype=np.float32)
+    for b in range(round_cards + 1):
+        made_rew = 5.0 if b == 0 else (10.0 + float(b))
+        rewards = np.where(ks == b, made_rew, -2.0 * np.abs(ks - float(b)))
+        ev[b] = float(np.sum(probs * rewards))
+    return ev
+
+
 def choose_bid(env, model, settings: PlaySettings, device) -> Tuple[int, Decision]:
     player = int(env.current_player)
+    round_cards = int(env.round_cards)
     legal = mask_to_bool(int(env.legal_bids_mask(player)), 11)
     start = time.perf_counter()
-    if model is None:
-        bid = heuristic_bid(legal, int(env.round_cards))
+    if settings.bot_level is not None:
+        bid = int(env.bot_action(settings.bot_level))
+        decision = Decision(f"{settings.bot_name} bot")
+    elif model is None:
+        bid = heuristic_bid(legal, round_cards)
         decision = Decision("heuristic")
-    elif settings.use_search and int(env.round_cards) == 1:
+    elif settings.use_search and round_cards == 1:
         q = model_q(model, env, player, "bid", device)
         ev = np.asarray(env.search_pannplump_bid_values(), dtype=np.float32)
-        combined = 0.5 * normalized_prior(q, legal) + 0.5 * normalized_prior(
-            ev, legal
-        )
-        bid = int(np.argmax(combined))
+        combined = 0.5 * q + 0.5 * ev
+        bid = int(np.argmax(np.where(legal, combined, -np.inf)))
         decision = Decision(
             "pannplump + bid head", extra=f"q={q[bid]:.2f}, ev={ev[bid]:.2f}"
         )
     else:
-        q = model_q(model, env, player, "bid", device)
-        bid = int(masked_argmax(q[None, :], legal[None, :])[0])
-        decision = Decision("bid head", extra=f"q={q[bid]:.2f}")
+        tokens, feats = encode_tensors(env, player, device)
+        with torch.inference_mode():
+            q_out, _, tricks_logits = model.forward_with_aux(tokens, feats, phase="bid")
+            q = q_out[0].float().cpu().numpy()
+            t_logits = tricks_logits[0].float().cpu().numpy()
+        t_ev = _tricks_expected_bid_values(t_logits, round_cards)
+        tac_bid = int(env.bot_action(2))
+        tac_prior = -1.5 * np.abs(np.arange(11, dtype=np.float32) - float(tac_bid))
+        combined = 0.35 * q + 0.45 * t_ev + 0.20 * tac_prior
+        bid = int(np.argmax(np.where(legal, combined, -np.inf)))
+        decision = Decision("bid+tricks head", extra=f"q={q[bid]:.2f}, tev={t_ev[bid]:.2f}")
     decision.elapsed_ms = (time.perf_counter() - start) * 1000.0
     return bid, decision
 
@@ -280,7 +304,10 @@ def choose_card(env, model, settings: PlaySettings, device) -> Tuple[int, Decisi
         decision = Decision("only legal card")
         decision.elapsed_ms = (time.perf_counter() - start) * 1000.0
         return card, decision
-    if model is None:
+    if settings.bot_level is not None:
+        card = int(env.bot_action(settings.bot_level))
+        decision = Decision(f"{settings.bot_name} bot")
+    elif model is None:
         bid = int(env.bids[player])
         tricks = int(env.tricks_won[player])
         card = heuristic_play(legal, bid, tricks)
@@ -300,14 +327,12 @@ def choose_card(env, model, settings: PlaySettings, device) -> Tuple[int, Decisi
         state = env.state()
         tricks_left = int(env.round_cards) - int(state["current_trick"])
         if tricks_left <= 5:
-            q_weight, ev_weight = 0.25, 0.75
+            q_weight, ev_weight = 0.35, 0.65
             mode = "endgame"
         else:
-            q_weight, ev_weight = 0.50, 0.50
+            q_weight, ev_weight = 0.65, 0.35
             mode = "midgame"
-        combined = q_weight * normalized_prior(
-            q, legal
-        ) + ev_weight * normalized_prior(ev, legal)
+        combined = q_weight * q + ev_weight * ev
         card = int(np.argmax(np.where(legal, combined, -np.inf)))
         decision = Decision(
             f"PIMC {settings.worlds}w + play head",
@@ -746,7 +771,147 @@ def play(
     show_final(console, totals, plumps)
 
 
+def run_gauntlet(console: Console, model: Optional[torch.nn.Module], device: torch.device) -> None:
+    challenger_name = "Transformer Model" if model is not None else "Tactician Bot"
+    console.print(
+        Panel.fit(
+            f"[bold]Boss Gauntlet Benchmark[/]\n"
+            f"Challenger: [bold cyan]{challenger_name}[/]\n"
+            f"Pitting challenger across all 4 seats against the 4-tier bot ladder.",
+            border_style="blue",
+        )
+    )
+
+    boss_info = [
+        ("Rookie", "Lv.1 Rookie", 0, 32, 10),
+        ("Regular", "Lv.2 Regular", 1, 32, 10),
+        ("Tactician", "Lv.3 Tactician", 2, 32, 10),
+        ("Final Boss", "Lv.4 Final Boss", 3, 16, 5),
+    ]
+
+    results = []
+    fighting_found = False
+
+    for name, label, bot_level, num_envs, rounds_per_seat in boss_info:
+        total_points = 0.0
+        total_opp_points = 0.0
+        total_rounds = 0
+        total_made = 0
+
+        for seat in range(4):
+            vec = plump_engine.PyRustVecEnv(
+                num_envs, seed=42 + bot_level * 100 + seat * 17
+            )
+            seat_rounds = 0
+            while seat_rounds < rounds_per_seat:
+                obs = vec.observe_batch()
+                toks, feats, legal, is_bid, players = obs
+                n = len(toks)
+                actions = np.zeros(n, dtype=np.uint8)
+                controlled = np.asarray(players) == seat
+
+                # Challenger actions
+                learner_idx = np.flatnonzero(controlled)
+                if len(learner_idx):
+                    if model is not None:
+                        for bidding in (True, False):
+                            phase_mask = np.asarray(is_bid, dtype=np.bool_) == bidding
+                            sub_idx = np.flatnonzero(controlled & phase_mask)
+                            if len(sub_idx) == 0:
+                                continue
+                            phase = "bid" if bidding else "play"
+                            n_actions = 11 if bidding else 52
+                            tokens = torch.from_numpy(toks[sub_idx]).long().to(device)
+                            features = torch.from_numpy(feats[sub_idx]).float().to(device)
+                            with torch.inference_mode():
+                                q = model(tokens, features, phase=phase).float().cpu().numpy()
+                            legal_rows = legal[sub_idx][:, :n_actions].astype(np.bool_)
+                            actions[sub_idx] = masked_argmax(q, legal_rows).astype(np.uint8)
+                    else:
+                        bot_acts = np.asarray(
+                            vec.bot_actions(np.full(n, 2, dtype=np.uint8))
+                        )
+                        actions[learner_idx] = bot_acts[learner_idx]
+
+                # Opponents bot actions
+                opp_idx = np.flatnonzero(~controlled)
+                if len(opp_idx):
+                    bot_acts = np.asarray(
+                        vec.bot_actions(np.full(n, bot_level, dtype=np.uint8))
+                    )
+                    actions[opp_idx] = bot_acts[opp_idx]
+
+                out = vec.step_batch(actions.tolist())
+                summaries = out["summaries"]
+                for j in range(len(summaries["env_indices"])):
+                    if seat_rounds >= rounds_per_seat:
+                        break
+                    bid = int(summaries["bids"][j, seat])
+                    tricks = int(summaries["tricks_won"][j, seat])
+                    points = float(summaries["points"][j, seat])
+                    opp_pts = float(
+                        (summaries["points"][j].sum() - summaries["points"][j, seat])
+                        / 3.0
+                    )
+                    total_points += points
+                    total_opp_points += opp_pts
+                    total_made += int(tricks == bid)
+                    seat_rounds += 1
+                    total_rounds += 1
+            del vec
+
+        ai_pts = total_points / max(1, total_rounds)
+        bot_pts = total_opp_points / max(1, total_rounds)
+        margin = ai_pts - bot_pts
+        made_rate = total_made / max(1, total_rounds)
+
+        if not fighting_found:
+            if margin > 0.001:
+                status = "[bold green][✓ DEFEATED][/bold green]"
+            else:
+                status = "[bold yellow][⚔ FIGHTING][/bold yellow]"
+                fighting_found = True
+        else:
+            status = "[dim][🔒 LOCKED  ][/dim]"
+
+        results.append((status, label, ai_pts, bot_pts, margin, made_rate, total_rounds))
+
+    table = Table(
+        title="[bold]Boss Gauntlet Benchmark Results[/bold]",
+        box=box.ROUNDED,
+        header_style="bold cyan",
+        show_lines=True,
+    )
+    table.add_column("Status", justify="center")
+    table.add_column("Boss Tier", justify="left")
+    table.add_column("Challenger Avg", justify="right")
+    table.add_column("Boss Avg", justify="right")
+    table.add_column("Margin", justify="right")
+    table.add_column("Made Bid %", justify="right")
+    table.add_column("Rounds", justify="center", style="dim")
+
+    for status, label, ai_pts, bot_pts, margin, made_rate, rounds in results:
+        margin_str = (
+            f"[bold green]+{margin:.2f}[/bold green]"
+            if margin > 0
+            else f"[bold red]{margin:.2f}[/bold red]"
+        )
+        table.add_row(
+            status,
+            label,
+            f"{ai_pts:.2f} pts",
+            f"{bot_pts:.2f} pts",
+            margin_str,
+            f"{made_rate:4.1%}",
+            str(rounds),
+        )
+
+    console.print(table)
+
+
 def load_ai_model(args, console: Console, device: torch.device):
+    if getattr(args, "bot", "none") != "none" and not getattr(args, "gauntlet", False):
+        return None
     if args.no_model:
         console.print("[yellow]Model disabled; AI uses the heuristic fallback.[/yellow]")
         return None
@@ -787,6 +952,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--max-rounds", type=int, default=len(ROUND_SCHEDULE))
+    parser.add_argument(
+        "--bot",
+        choices=["none", "rookie", "regular", "tactician", "boss"],
+        default="none",
+        help="Play against hardcoded bot tier (none, rookie, regular, tactician, boss)",
+    )
+    parser.add_argument(
+        "--gauntlet",
+        action="store_true",
+        help="Run fast head-to-head Boss Gauntlet benchmark and exit",
+    )
     return parser.parse_args()
 
 
@@ -798,39 +974,86 @@ def main() -> None:
     else:
         device = torch.device(args.device)
 
-    model = load_ai_model(args, console, device)
-    settings = PlaySettings(
-        autoplay=args.autoplay,
-        use_search=args.search > 0 and model is not None,
-        worlds=args.search if args.search > 0 else 32,
-        model_available=model is not None,
-    )
+    if args.gauntlet:
+        model = None if args.no_model else load_ai_model(args, console, device)
+        run_gauntlet(console, model, device)
+        return
 
-    if args.autoplay:
-        search_desc = (
-            f"on ({settings.worlds} worlds)"
-            if settings.use_search
-            else "off (policy head)"
-        )
-        console.print(
-            Panel.fit(
-                f"[bold]Autoplay[/] {DASH} 4 AI players {DASH} "
-                f"search {search_desc} {DASH} model "
-                f"{'loaded' if model is not None else 'heuristic'}",
-                border_style="green",
-            )
+    bot_level_map = {
+        "rookie": 0,
+        "regular": 1,
+        "tactician": 2,
+        "boss": 3,
+    }
+    bot_level = bot_level_map.get(args.bot)
+    bot_name = "Final Boss" if args.bot == "boss" else args.bot.capitalize()
+
+    if bot_level is not None:
+        model = None
+        settings = PlaySettings(
+            autoplay=args.autoplay,
+            use_search=False,
+            worlds=0,
+            model_available=False,
+            bot_level=bot_level,
+            bot_name=bot_name,
         )
     else:
-        console.print(
-            Panel.fit(
-                "[bold]Swedish Plump[/]\n"
-                "20 rounds: 10 cards down to 1, then back up to 10.\n"
-                "Bid exactly your tricks to score. Miss and it is a plump.\n"
-                "You are Seat 0. Type 'help' for commands.",
-                title="Welcome",
-                border_style="green",
-            )
+        model = load_ai_model(args, console, device)
+        settings = PlaySettings(
+            autoplay=args.autoplay,
+            use_search=args.search > 0 and model is not None,
+            worlds=args.search if args.search > 0 else 32,
+            model_available=model is not None,
+            bot_level=None,
+            bot_name="none",
         )
+
+    if args.autoplay:
+        if settings.bot_level is not None:
+            console.print(
+                Panel.fit(
+                    f"[bold]Autoplay[/] {DASH} 4 {settings.bot_name} Bots",
+                    border_style="green",
+                )
+            )
+        else:
+            search_desc = (
+                f"on ({settings.worlds} worlds)"
+                if settings.use_search
+                else "off (policy head)"
+            )
+            console.print(
+                Panel.fit(
+                    f"[bold]Autoplay[/] {DASH} 4 AI players {DASH} "
+                    f"search {search_desc} {DASH} model "
+                    f"{'loaded' if model is not None else 'heuristic'}",
+                    border_style="green",
+                )
+            )
+    else:
+        if settings.bot_level is not None:
+            console.print(
+                Panel.fit(
+                    f"[bold]Swedish Plump vs {settings.bot_name} Bot[/]\n"
+                    "20 rounds: 10 cards down to 1, then back up to 10.\n"
+                    f"Opponents (Seats 1, 2, 3) are powered by the {settings.bot_name} bot.\n"
+                    "You are Seat 0. Type 'help' for commands.",
+                    title="Welcome",
+                    border_style="green",
+                )
+            )
+        else:
+            console.print(
+                Panel.fit(
+                    "[bold]Swedish Plump[/]\n"
+                    "20 rounds: 10 cards down to 1, then back up to 10.\n"
+                    "Bid exactly your tricks to score. Miss and it is a plump.\n"
+                    "You are Seat 0. Type 'help' for commands.",
+                    title="Welcome",
+                    border_style="green",
+                )
+            )
 
     try:
         play(
