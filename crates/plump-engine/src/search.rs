@@ -67,105 +67,16 @@ fn table_bits(env: &FastEnv) -> u64 {
     bits
 }
 
-/// Pick the card that best ducks under the current led-suit winner, or the
-/// lowest legal card when leading / when ducking is impossible.
-#[inline]
-fn best_led_rank(env: &FastEnv) -> u8 {
-    let mut best = 0u8;
-    for i in 0..env.table_len as usize {
-        let card = env.table[i].1;
-        if suit_of(card) == env.led_suit {
-            best = best.max(card % 13);
-        }
-    }
-    best
-}
-
-fn highest_card(cards: &[u8]) -> u8 {
-    *cards
-        .iter()
-        .max_by_key(|&&c| (rank_of(c) as i16) * 8 + suit_of(c) as i16)
-        .unwrap()
-}
-
-fn lowest_card(cards: &[u8]) -> u8 {
-    *cards
-        .iter()
-        .min_by_key(|&&c| (rank_of(c) as i16) * 8 + suit_of(c) as i16)
-        .unwrap()
-}
-
 /// Heuristic card for rollouts and for the `--search 0` greedy mode.
+/// Upgraded to Tactician bot so rollouts are significantly smarter.
 pub fn heuristic_card(env: &FastEnv) -> u8 {
-    let p = env.current_player as usize;
-    let legal = env.legal_cards_mask(p);
-    debug_assert!(legal != 0);
-    let cards = cards_from_mask(legal);
-    if cards.len() == 1 {
-        return cards[0];
-    }
-
-    let bid = env.bids[p].max(0) as i32;
-    let tricks = env.tricks_won[p] as i32;
-
-    if env.table_len == 0 {
-        return if tricks < bid {
-            highest_card(&cards)
-        } else {
-            lowest_card(&cards)
-        };
-    }
-
-    let led = env.led_suit;
-    let best = best_led_rank(env);
-
-    if tricks < bid {
-        // Still need tricks: win the trick if possible, otherwise dump low.
-        let mut winning: Vec<u8> = cards
-            .iter()
-            .copied()
-            .filter(|&c| suit_of(c) == led && c % 13 > best)
-            .collect();
-        if winning.is_empty() {
-            lowest_card(&cards)
-        } else {
-            winning.sort_by_key(|&c| c % 13);
-            *winning.last().unwrap()
-        }
-    } else {
-        // Bid already made: duck under the current winner if possible.
-        let mut ducks: Vec<u8> = cards
-            .iter()
-            .copied()
-            .filter(|&c| suit_of(c) != led || c % 13 < best)
-            .collect();
-        if ducks.is_empty() {
-            lowest_card(&cards)
-        } else {
-            ducks.sort_by_key(|&c| c % 13);
-            *ducks.last().unwrap()
-        }
-    }
+    crate::bots::tactician_card(env)
 }
 
-/// Conservative bid used by rollouts (and as a heuristic baseline).
+/// Heuristic bid used by rollouts (and as a heuristic baseline).
+/// Upgraded to Tactician bot so rollouts are significantly smarter.
 pub fn heuristic_bid(env: &FastEnv) -> u8 {
-    let p = env.current_player as usize;
-    let mask = env.legal_bids_mask(p);
-    if mask == 0 {
-        return 0;
-    }
-    let target = (env.round_cards as i32 / 4).clamp(0, env.round_cards as i32);
-    let mut best = 0u8;
-    let mut best_dist = i32::MAX;
-    for bid in bids_from_mask(mask) {
-        let dist = (bid as i32 - target).abs();
-        if dist < best_dist {
-            best_dist = dist;
-            best = bid;
-        }
-    }
-    best
+    crate::bots::tactician_bid(env)
 }
 
 fn rollout(mut env: FastEnv) -> [f32; 4] {

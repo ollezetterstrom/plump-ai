@@ -1,6 +1,7 @@
 target/
 .env
 .venv/
+.venv
 __pycache__/
 *.py[cod]
 .pytest_cache/

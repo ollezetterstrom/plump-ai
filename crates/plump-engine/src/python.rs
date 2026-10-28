@@ -230,6 +230,11 @@ impl PyFastEnv {
         }))
     }
 
+    fn bot_action(&self, py: Python<'_>, level: u8) -> u8 {
+        let env = self.env;
+        py.allow_threads(move || crate::bots::bot_action(&env, level))
+    }
+
     fn state(&self, py: Python<'_>) -> PyResult<PyObject> {
         let dict = PyDict::new_bound(py);
         let hands: Vec<Vec<u8>> = self.env.hands.iter().map(|&m| cards_in(m)).collect();
@@ -438,6 +443,28 @@ impl PyRustVecEnv {
 
         Ok(dict.into())
     }
+
+    fn bot_actions<'py>(
+        &self,
+        py: Python<'py>,
+        levels: Bound<'py, PyAny>,
+    ) -> PyResult<Py<PyArray1<u8>>> {
+        let levs: Vec<u8> = if let Ok(arr) = levels.extract::<PyReadonlyArray1<u8>>() {
+            arr.as_slice()?.to_vec()
+        } else if let Ok(arr64) = levels.extract::<PyReadonlyArray1<i64>>() {
+            arr64.as_slice()?.iter().map(|&x| x as u8).collect()
+        } else if let Ok(v) = levels.extract::<Vec<u8>>() {
+            v
+        } else if let Ok(single) = levels.extract::<u8>() {
+            vec![single]
+        } else {
+            return Err(PyValueError::new_err(
+                "expected list of ints or 1D numpy array for levels",
+            ));
+        };
+        let actions = py.allow_threads(|| self.inner.bot_actions(&levs));
+        Ok(actions.into_pyarray_bound(py).unbind())
+    }
 }
 
 /// Apply independent random suit permutations to a sampled batch.
@@ -519,5 +546,9 @@ fn plump_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(augment_batch_numpy, m)?)?;
     m.add_function(wrap_pyfunction!(terminal_reward_py, m)?)?;
     m.add_function(wrap_pyfunction!(display_points_py, m)?)?;
+    m.add("BOT_ROOKIE", crate::bots::BOT_ROOKIE)?;
+    m.add("BOT_REGULAR", crate::bots::BOT_REGULAR)?;
+    m.add("BOT_TACTICIAN", crate::bots::BOT_TACTICIAN)?;
+    m.add("BOT_FINAL_BOSS", crate::bots::BOT_FINAL_BOSS)?;
     Ok(())
 }

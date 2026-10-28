@@ -68,6 +68,7 @@ struct PendingTransition {
     action: u8,
     player: u8,
     is_play: bool,
+    #[allow(dead_code)]
     trick: u8,
 }
 
@@ -167,6 +168,29 @@ impl RustVecEnv {
         obs
     }
 
+    /// Compute bot actions for each environment according to the requested bot levels.
+    /// If `levels.len() == 1`, that level is applied across all environments.
+    pub fn bot_actions(&self, levels: &[u8]) -> Vec<u8> {
+        if levels.len() == 1 {
+            let level = levels[0];
+            self.envs
+                .par_iter()
+                .map(|env| crate::bots::bot_action(env, level))
+                .collect()
+        } else {
+            assert_eq!(
+                levels.len(),
+                self.envs.len(),
+                "levels length must match envs length or be 1"
+            );
+            self.envs
+                .par_iter()
+                .zip(levels.par_iter())
+                .map(|(env, &level)| crate::bots::bot_action(env, level))
+                .collect()
+        }
+    }
+
     fn reset_env(&mut self, i: usize) {
         self.schedule_pos[i] = (self.schedule_pos[i] + 1) % ROUND_SCHEDULE.len();
         let next_start = (self.envs[i].start_bidder + 1) % 4;
@@ -244,52 +268,13 @@ impl RustVecEnv {
     /// and drain the pending transitions.
     fn finalize_env(&mut self, i: usize) -> (Vec<Transition>, RoundSummary) {
         let env = self.envs[i];
-        let round_cards = env.round_cards as usize;
-        let winners = env.trick_winners();
-
-        // Per-trick shaped reward for every player, using cumulative tricks.
-        let mut shaped = vec![[0.0f32; 4]; round_cards];
-        let mut cumulative = [0u8; 4];
-        for t in 0..round_cards {
-            if let Some(&w) = winners.get(t) {
-                cumulative[w] += 1;
-            }
-            for p in 0..4 {
-                let bid = env.bids[p].max(0) as i32;
-                let won = winners.get(t).copied() == Some(p);
-                let count = cumulative[p] as i32;
-                shaped[t][p] = if won {
-                    if count <= bid {
-                        1.0
-                    } else {
-                        -1.5
-                    }
-                } else if count < bid {
-                    -1.0
-                } else {
-                    0.5
-                };
-            }
-        }
-        let mut suffix = vec![[0.0f32; 4]; round_cards + 1];
-        for t in (0..round_cards).rev() {
-            for p in 0..4 {
-                suffix[t][p] = suffix[t + 1][p] + shaped[t][p];
-            }
-        }
-
         let terminal: [f32; 4] =
             std::array::from_fn(|p| terminal_reward(env.tricks_won[p], env.bids[p]));
 
         let mut transitions = Vec::with_capacity(self.pending[i].len());
         for rec in self.pending[i].drain(..) {
             let p = rec.player as usize;
-            let ret = if rec.is_play {
-                let t = (rec.trick as usize).min(round_cards);
-                terminal[p] + 0.20 * suffix[t][p]
-            } else {
-                terminal[p]
-            };
+            let ret = terminal[p];
             transitions.push(Transition {
                 toks: rec.toks,
                 feats: rec.feats,
@@ -429,33 +414,10 @@ mod tests {
 
         let (transitions, summary) = vec.finalize_env(0);
         assert_eq!(transitions.len(), 8);
-        let winner = round.trick_winners()[0];
         for t in &transitions {
             let p = t.player as usize;
             let terminal = summary.rewards[p];
-            if t.is_play {
-                let shaped = if p == winner {
-                    // Bid 0/1 matters: the bid in this test is the lowest
-                    // legal one, which is 0 for the first three bidders.
-                    let after = 1i32;
-                    let bid = round.bids[p].max(0) as i32;
-                    if after <= bid {
-                        1.0
-                    } else {
-                        -1.5
-                    }
-                } else {
-                    let bid = round.bids[p].max(0) as i32;
-                    if 0 < bid {
-                        -1.0
-                    } else {
-                        0.5
-                    }
-                };
-                assert!((t.ret - (terminal + 0.20 * shaped)).abs() < 1e-6);
-            } else {
-                assert!((t.ret - terminal).abs() < 1e-6);
-            }
+            assert!((t.ret - terminal).abs() < 1e-6);
         }
     }
 }
